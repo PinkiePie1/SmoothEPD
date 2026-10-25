@@ -1,0 +1,491 @@
+/* 秒表演示 —— 局部窗口 + 贪吃蛇 + fps 读数
+ *
+ * 屏幕布局：
+ *
+ *      ┌──────────────────────────────┐
+ *      │  ┌────────────────────────┐  │
+ *      │  │          49            │  │   fps（一半字号，CELL/2）
+ *      │  │        23.47           │  │   秒表（两位小数）
+ *      │  └────────────────────────┘  │
+ *      │   ↑ 一圈贪吃蛇沿着这条矩形环跑 │
+ *      └──────────────────────────────┘
+ *
+ */
+#include "print.h"
+#include "epd_fast.h"
+
+#include <string.h>
+
+#define RUN_MS      120000u   /* 演示时长 */
+#define REFRESH_MS  1000u     /* 每多少毫秒打印一次状态 */
+
+#define CELL        8         /* 秒表字号：每字 3*CELL 宽、5*CELL 高 */
+#define FPS_CELL    (CELL/2)  /* fps 字号：一半大小 */
+
+/* 秒表内容：4 个数字 + 1 个小数点 */
+#define SW_W        (4 * 4 * CELL + 3 * CELL)
+#define SW_H        (5 * CELL)
+#define SW_X        ((EPD_W - SW_W) / 2)
+/* 竖直方向：fps(5*FPS_CELL) + 间隔 + 秒表，整体居中 */
+#define FPS_GAP     6
+#define FPS_Y       ((EPD_H - (5 * FPS_CELL + FPS_GAP + SW_H)) / 2)
+#define SW_Y        (FPS_Y + 5 * FPS_CELL + FPS_GAP)
+
+/* 贪吃蛇跑的矩形环，套在秒表外面 */
+#define RING_X0     (SW_X - 8)
+#define RING_Y0     (FPS_Y - 4)
+#define RING_X1     (SW_X + SW_W + 7)
+#define RING_Y1     (SW_Y + SW_H + 5)
+
+#define SNAKE_LEN   90        /* 蛇身长度（路径格数） */
+#define SNAKE_STEP  1         /* 每帧头往前爬几格：1 最稳（每个像素能拿到足够脉冲） */
+#define DIGIT_DIV   7         /* 数字每几帧更新一次：太快会发灰（每个像素需要约 7 帧驱动） */
+
+static uint8_t frame[EPD_FRAME_BYTES] __attribute__((aligned(4)));
+
+/* ---------------------------------------------------------------- 绘图 */
+
+/* bit 1 = 白, bit 0 = 黑 */
+static void px(int x, int y, int ink)
+{
+    if ((x < 0) || (x >= EPD_W) || (y < 0) || (y >= EPD_H)) {
+        return;
+    }
+    if (ink) {
+        frame[(uint32_t)y * EPD_STRIDE + (uint32_t)(x >> 3)] &= (uint8_t)~(0x80u >> (x & 7));
+    } else {
+        frame[(uint32_t)y * EPD_STRIDE + (uint32_t)(x >> 3)] |= (uint8_t)(0x80u >> (x & 7));
+    }
+}
+
+static void fill(int x, int y, int w, int h, int ink)
+{
+    for (int j = 0; j < h; ++j) {
+        for (int i = 0; i < w; ++i) {
+            px(x + i, y + j, ink);
+        }
+    }
+}
+
+/* 3x5 点阵数字，每点放大 cell 倍 */
+static const uint8_t digit_font[10][5] = {
+    { 0x7, 0x5, 0x5, 0x5, 0x7 },
+    { 0x2, 0x6, 0x2, 0x2, 0x7 },
+    { 0x7, 0x1, 0x7, 0x4, 0x7 },
+    { 0x7, 0x1, 0x7, 0x1, 0x7 },
+    { 0x5, 0x5, 0x7, 0x1, 0x1 },
+    { 0x7, 0x4, 0x7, 0x1, 0x7 },
+    { 0x7, 0x4, 0x7, 0x5, 0x7 },
+    { 0x7, 0x1, 0x1, 0x1, 0x1 },
+    { 0x7, 0x5, 0x7, 0x5, 0x7 },
+    { 0x7, 0x5, 0x7, 0x1, 0x7 },
+};
+
+static int glyph(int x0, int y0, int cell, const uint8_t rows[5])
+{
+    for (int row = 0; row < 5; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            if (rows[row] & (0x4 >> col)) {
+                fill(x0 + col * cell, y0 + row * cell, cell, cell, 1);
+            }
+        }
+    }
+    return x0 + 4 * cell;
+}
+
+static int digit(int x0, int y0, int cell, uint8_t d)
+{
+    return glyph(x0, y0, cell, digit_font[d > 9u ? 9u : d]);
+}
+
+static int dot(int x0, int y0, int cell)
+{
+    fill(x0, y0 + 4 * cell, cell, cell, 1);
+    return x0 + 3 * cell;
+}
+
+/* ------------------------------------------------------- 贪吃蛇（矩形环） */
+
+static uint32_t ring_w(void) { return (uint32_t)(RING_X1 - RING_X0); }
+static uint32_t ring_h(void) { return (uint32_t)(RING_Y1 - RING_Y0); }
+static uint32_t ring_perimeter(void) { return 2u * (ring_w() + ring_h()); }
+
+/* s = 沿着环走过的格数（顺时针：上 -> 右 -> 下 -> 左） */
+static void ring_point(uint32_t s, int *x, int *y)
+{
+    const uint32_t w = ring_w();
+    const uint32_t h = ring_h();
+
+    s %= ring_perimeter();
+
+    if (s < w) {
+        *x = RING_X0 + (int)s;
+        *y = RING_Y0;
+    } else if ((s -= w) < h) {
+        *x = RING_X1;
+        *y = RING_Y0 + (int)s;
+    } else if ((s -= h) < w) {
+        *x = RING_X1 - (int)s;
+        *y = RING_Y1;
+    } else {
+        s -= w;
+        *x = RING_X0;
+        *y = RING_Y1 - (int)s;
+    }
+}
+
+/* head = 蛇头所在的格数；身体跟在后面，越靠尾部越细 */
+static void draw_snake(uint32_t head)
+{
+    const uint32_t per = ring_perimeter();
+
+    for (uint32_t i = 0; i < SNAKE_LEN; ++i) {
+        int x, y;
+        const uint32_t s = (head + per * 4u - i) % per;
+
+        ring_point(s, &x, &y);
+        px(x, y, 1);
+        if (i * 3u < SNAKE_LEN * 2u) {      /* 前 2/3 是 2x2 的粗身，剩下 1/3 单像素 */
+            px(x + 1, y, 1);                /* 尾巴细下去，看起来像渐隐 */
+            px(x, y + 1, 1);
+            px(x + 1, y + 1, 1);
+        }
+    }
+    /* 蛇头再粗一点，看起来有"头" */
+    {
+        int x, y;
+        ring_point(head % per, &x, &y);
+        fill(x - 1, y - 1, 4, 4, 1);
+    }
+}
+
+
+/* 轮廓线宽（像素）：细线在电子纸上最容易发灰，画粗一点观感稳 */
+#define SHAPE_STROKE    1
+
+/* ---------------------------------------------------------- 背景动画图形
+ *
+ * DVD demo 里那套：几个空心圆和空心正方形，一边缓慢移动一边缩放/旋转。
+ * 尺寸放大到几乎铺满屏幕，允许互相重叠，也允许压到秒表周围。
+ */
+
+/* sin(2*pi*i/32) * 256 */
+static const int16_t sin32[32] = {
+       0,   50,   98,  142,  181,  213,  236,  251,
+     256,  251,  236,  213,  181,  142,   98,   50,
+       0,  -50,  -98, -142, -181, -213, -236, -251,
+    -256, -251, -236, -213, -181, -142,  -98,  -50,
+};
+
+static int wave(uint32_t anim, uint32_t period, uint32_t phase)
+{
+    return sin32[((anim / period) + phase) & 31u];
+}
+
+static void draw_hollow_circle(int cx, int cy, int r)
+{
+    if (r < 2) {
+        return;
+    }
+    for (int y = cy - r - SHAPE_STROKE; y <= cy + r + SHAPE_STROKE; ++y) {
+        for (int x = cx - r - SHAPE_STROKE; x <= cx + r + SHAPE_STROKE; ++x) {
+            const int dx = x - cx;
+            const int dy = y - cy;
+            const int d2 = dx * dx + dy * dy;
+
+            if ((d2 <= (r + SHAPE_STROKE) * (r + SHAPE_STROKE)) &&
+                (d2 >= (r - SHAPE_STROKE) * (r - SHAPE_STROKE))) {
+                px(x, y, 1);
+            }
+        }
+    }
+}
+
+/* 空心正方形，可绕中心旋转（cosv/sinv 是 256 定点的余弦/正弦） */
+static void draw_hollow_square(int cx, int cy, int half, int cosv, int sinv)
+{
+    const int ext = (half * 3) / 2 + 2;
+
+    for (int y = cy - ext; y <= cy + ext; ++y) {
+        for (int x = cx - ext; x <= cx + ext; ++x) {
+            const int dx = x - cx;
+            const int dy = y - cy;
+            const int lx = (dx * cosv + dy * sinv) >> 8;     /* 转到方块自身坐标 */
+            const int ly = (-dx * sinv + dy * cosv) >> 8;
+            const int ax = (lx < 0) ? -lx : lx;
+            const int ay = (ly < 0) ? -ly : ly;
+            const int m = (ax > ay) ? ax : ay;              /* 切比雪夫距离 = 边 */
+
+            if ((m >= half - 1) && (m <= half - 1 + SHAPE_STROKE)) {
+                px(x, y, 1);
+            }
+        }
+    }
+}
+
+/* 四个图形到处漂、尺寸大幅脉动、方块自转。允许互相交叠，也允许压到中间的
+ * 秒表区域 —— 数字是后画的，画面看着热闹就够了。
+ *
+ * 每个图形用两个不同周期的正弦给 x/y，走出李萨如轨迹（不会来回走直线）。
+ *
+ * 漂移幅度加大之后速度也变快了，边线动太快看不清，所以整体放慢 SHAPE_SLOW 倍：
+ * 正弦表 32 格，一格 period 帧，一个完整周期 = 32 * period * SHAPE_SLOW 帧。
+ * 45 fps 下，period 13 的轴一圈约 18 秒，方块自转一圈约 6 秒。 */
+#define SHAPE_SLOW  2u
+
+
+static int drift(uint32_t anim, uint32_t period, uint32_t phase, int amplitude)
+{
+    return (amplitude * wave(anim, period, phase)) / 256;
+}
+
+static void draw_shapes(uint32_t anim)
+{
+    const uint32_t a = anim;                 /* 时间轴（原速） */
+    const uint32_t rot1 = a / 4u;            /* 两个方块各自的旋转相位 */
+    const uint32_t rot2 = a / 3u;
+
+    /* 小范围版：漂移 ±12、半径 14..22、方块半边长 8..15，
+     * 外接框一律留在 12..185 之内，不会碰到边框。 */
+
+    /* 左上：圆 */
+    draw_hollow_circle(48 + drift(a, 9u, 0, 12),
+                       44 + drift(a, 7u, 8, 8),
+                       18 + drift(a, 6u, 0, 4));
+
+    /* 右上：方块，自转 */
+    draw_hollow_square(146 - drift(a, 9u, 0, 10),
+                       44 - drift(a, 7u, 8, 8),
+                       12 + drift(a, 5u, 13, 3),
+                       sin32[(rot1 + 8u) & 31u], sin32[rot1 & 31u]);
+
+    /* 左下：方块，反向自转 */
+    draw_hollow_square(48 + drift(a, 9u, 0, 10),
+                       154 + drift(a, 7u, 8, 8),
+                       11 + drift(a, 5u, 21, 3),
+                       sin32[rot2 & 31u], sin32[(rot2 + 8u) & 31u]);
+
+    /* 右下：圆 */
+    draw_hollow_circle(148 - drift(a, 9u, 0, 12),
+                       152 - drift(a, 7u, 8, 8),
+                       19 + drift(a, 6u, 16, 4));
+}
+
+/* ---------------------------------------------------------------- 边框
+ *
+ * 贴着屏幕最外圈画，4 像素实 / 4 像素空。
+ * 四条边用同一套相位，所以四个角一定是"实"的。
+ */
+#define BORDER_ON       4
+#define BORDER_PERIOD   (BORDER_ON * 2)
+
+/* offset = 虚线沿周长前进的格数，每加 1 看起来就往前挪 1 像素。
+ * 周长坐标：顶边 0..199，右边 200..399，下边 400..599，左边 600..799，
+ * 所以虚线会连续地绕四个角爬，不会在角上断掉。 */
+static void draw_border(uint32_t offset)
+{
+    for (int i = 0; i < EPD_W; ++i) {
+        const uint32_t st = (uint32_t)i + offset;                        /* 顶边：左 -> 右 */
+        const uint32_t sb = 400u + (uint32_t)(EPD_W - 1 - i) + offset;   /* 底边：右 -> 左 */
+
+        if ((st % BORDER_PERIOD) < BORDER_ON) {
+            px(i, 0, 1);
+        }
+        if ((sb % BORDER_PERIOD) < BORDER_ON) {
+            px(i, EPD_H - 1, 1);
+        }
+    }
+    for (int j = 0; j < EPD_H; ++j) {
+        const uint32_t sr = 200u + (uint32_t)j + offset;                 /* 右边：上 -> 下 */
+        const uint32_t sl = 600u + (uint32_t)(EPD_H - 1 - j) + offset;   /* 左边：下 -> 上 */
+
+        if ((sr % BORDER_PERIOD) < BORDER_ON) {
+            px(EPD_W - 1, j, 1);
+        }
+        if ((sl % BORDER_PERIOD) < BORDER_ON) {
+            px(0, j, 1);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- 合成 */
+
+static void compose(uint32_t centis, uint32_t fps, uint32_t head, uint32_t anim)
+{
+    const uint32_t sec = centis / 100u;
+    const uint8_t d0 = (uint8_t)((sec / 10u) % 10u);
+    const uint8_t d1 = (uint8_t)(sec % 10u);
+    const uint8_t d2 = (uint8_t)((centis / 10u) % 10u);
+    const uint8_t d3 = (uint8_t)(centis % 10u);
+
+    memset(frame, 0xFF, sizeof(frame));      /* 清成白色 */
+
+    draw_border(anim / 3u);                  /* 虚线绕屏爬：3 帧挪 1 像素 */
+
+    /* 背景动画图形（会压过中心区域，可读性不是重点） */
+    draw_shapes(anim);
+
+    /* fps：一半字号，秒表正上方居中 */
+    {
+        const int w = 2 * 4 * FPS_CELL;
+        int x = (EPD_W - w) / 2;
+
+        x = digit(x, FPS_Y, FPS_CELL, (uint8_t)((fps / 10u) % 10u));
+        (void)digit(x, FPS_Y, FPS_CELL, (uint8_t)(fps % 10u));
+    }
+
+    /* 秒表：SS.dd */
+    {
+        int x = SW_X;
+
+        x = digit(x, SW_Y, CELL, d0);
+        x = digit(x, SW_Y, CELL, d1);
+        x = dot(x, SW_Y, CELL);
+        x = digit(x, SW_Y, CELL, d2);
+        (void)digit(x, SW_Y, CELL, d3);
+    }
+
+    draw_snake(head);
+}
+
+/* ------------------------------------------------------------------ 主程序 */
+
+static uint32_t s_elapsed_ms;
+static uint32_t s_last_cnt;
+static uint32_t s_frac;
+
+static uint32_t elapsed_ms(void)
+{
+    const uint32_t now = EPD_TickNow();
+    const uint32_t counts = now - s_last_cnt;
+    const uint32_t per_ms = HCLKClock / 1000u;
+
+    s_last_cnt = now;
+    s_frac += counts;
+    if (s_frac >= per_ms) {
+        s_elapsed_ms += s_frac / per_ms;
+        s_frac %= per_ms;
+    }
+    return s_elapsed_ms;
+}
+
+int main(void)
+{
+    SystemAndCoreClockUpdate();
+    Delay_Init();
+    PRINT_INIT();                        /* V5F 上这条路走的是 IPC -> V3F USART1 */
+
+    PRINT("\r\n[SW] stopwatch + snake\r\n");
+    PRINT("[SW] SYSCLK=%u MHz, HCLK=%u MHz\r\n",
+          (unsigned)(SystemCoreClock / 1000000u), (unsigned)(HCLKClock / 1000000u));
+
+    EPD_TickInit();
+    EPD_Hal_Init();
+    EPD_DelayMs(20);
+
+    compose(0, 0, 0, 0);
+
+    {
+        const uint32_t t_init = EPD_TickNow();
+
+        EPD_Init();
+        EPD_SendDisplay(frame);
+        PRINT("[SW] full refresh %u ms\r\n",
+              (unsigned)((uint32_t)(EPD_TickNow() - t_init) / (HCLKClock / 1000u)));
+        (void)t_init;
+    }
+
+    EPD_FastBegin(frame);
+    EPD_FastPrepare();
+    PRINT("[SW] fast mode ready\r\n");
+
+    s_last_cnt = EPD_TickNow();
+    s_elapsed_ms = 0;
+    s_frac = 0;
+
+    uint32_t next_report = 0;
+    uint32_t fps = 0;
+    uint32_t scans_last = 0;
+    uint32_t head = 0;
+
+    uint32_t shown = 0;
+    uint32_t frame_no = 0;
+
+    while (elapsed_ms() < RUN_MS) {
+        const uint32_t now = elapsed_ms();
+
+        if ((frame_no % DIGIT_DIV) == 0u) {
+            shown = now / 10u;                  /* 百分之一秒，每 DIGIT_DIV 帧更新 */
+        }
+        ++frame_no;
+
+        compose(shown, fps, head, frame_no);
+        (void)EPD_FastFrame(frame);
+        head += SNAKE_STEP;
+
+        if (now - next_report >= REFRESH_MS) {
+            const uint32_t total = EPD_FastScanCount();
+
+            next_report = now;
+            if (total < scans_last) {           /* 清洁全刷会让计数归零，避免下溢 */
+                scans_last = 0;
+            }
+            fps = total - scans_last;           /* 这一秒刷了多少帧，屏幕上的 fps 用它 */
+            scans_last = total;
+
+            {
+                uint32_t mask, spi, busy, scans;
+                const uint32_t us = HCLKClock / 1000000u;
+
+                EPD_TimingRead(&mask, &spi, &busy, &scans);
+                PRINT("[SW] t=%u.%u  fps=%u | mask=%u spi=%u busy=%u us | rows~%u/200\r\n",
+                      (unsigned)(now / 1000u), (unsigned)((now % 1000u) / 100u),
+                      (unsigned)fps,
+                      (unsigned)(scans ? mask / scans / us : 0u),
+                      (unsigned)(scans ? spi / scans / us : 0u),
+                      (unsigned)(scans ? busy / scans / us : 0u),
+                      (unsigned)EPD_RowsAvg());
+                EPD_TimingReset();
+            }
+        }
+    }
+
+    PRINT("[SW] run finished\r\n");
+
+    /* ---- 收尾流程 ----
+     * 1) 继续生成新帧 2 秒：动画自然收个尾
+     * 2) 之后 1 秒不再生成新帧：同一帧反复交给驱动，让它自己把波形走完
+     *    （内容不变 -> 驱动进去就只有 HOLD 扫描）
+     * 3) 全刷一次：得到一张对比度正常的干净画面
+     * 4) 关屏进深度睡眠：电子纸断电后图像保留，面板不再空刷
+     */
+    {
+        const uint32_t t_end = elapsed_ms() + 2000u;
+
+        while (elapsed_ms() < t_end) {
+            compose(elapsed_ms() / 10u, fps, head, ++frame_no);
+            (void)EPD_FastFrame(frame);
+            head += SNAKE_STEP;
+        }
+    }
+    PRINT("[SW] tail: 2 s of new frames done\r\n");
+
+    {
+        const uint32_t t_end = elapsed_ms() + 1000u;
+
+        while (elapsed_ms() < t_end) {
+            (void)EPD_FastFrame(frame);          /* frame 不变，反复推同一帧 */
+        }
+    }
+    PRINT("[SW] tail: 1 s of identical frames done\r\n");
+
+    EPD_SendDisplay(frame);                      /* 全刷一次，画面干净 */
+    PRINT("[SW] tail: full refresh done\r\n");
+
+    EPD_Sleep();                                 /* 关屏 + 深度睡眠，图像保留 */
+    PRINT("[SW] EPD off (image kept)\r\n");
+
+    for (;;) {
+        __WFI();        /* 之后一直睡，面板不再有任何动作 */
+    }
+}

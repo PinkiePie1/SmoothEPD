@@ -1,0 +1,11 @@
+D:\repos\EPD30FPS\417QEUEPD\CH32H417EPD\CH32H417EPD.wvsln:
+BuildOrder=CH32H417EPD_V3F,CH32H417EPD_V5F
+-arm:${eclipse_home}\toolchain\arm-none-eabi-gcc\bin
+-build:${eclipse_home}\toolchain\Build Tools\bin
+-openocd name:openocd.exe
+-openocd path:${eclipse_home}\toolchain\OpenOCD\bin
+-rv:${eclipse_home}\toolchain\RISC-V Embedded GCC\bin
+D:\repos\EPD30FPS\417QEUEPD\CH32H417EPD\V3F
+..\V3F
+D:\repos\EPD30FPS\417QEUEPD\CH32H417EPD\V5F
+..\V5F

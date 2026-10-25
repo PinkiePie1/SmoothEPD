@@ -1,0 +1,1 @@
+{"kernelName":"V3F","isMaster":true,"debugOptions":{"dualCoreDebug":true,"slaveGDBPort":3334,"masterGDBPort":3333},"mate":"../V5F","mergedOptions":{"enabled":false,"mergedList":{"name":"Merge.bin","filledWith":"0xFF","files":[{"filePath":"../V5F/obj/CH32H417EPD_V5F.hex"}]},"downloadMerged":true,"loadMergedBeforeDebug":true,"retainOffsetData":true}}
