@@ -8,13 +8,10 @@
  * Frame format: 25 bytes per row, 5000 bytes, MSB is the leftmost pixel,
  * bit 1 = WHITE and bit 0 = BLACK.
  *
- * Wiring (CH32V303VCT6), 全部 PA 口：
+ *   默认使用SPI1。在V303和H417上都是
  *   SCK  PA5  SPI1
  *   MOSI PA7  SPI1
- *   CS   PA4  软件片选
- *   DC   PA3
- *   RST  PA2
- *   BUSY PA1  输入上拉
+ *   其他接线参考.c文件
  *
  * 具体引脚宏在 epd_fast.c 顶部的「移植区」里，换板子改那里即可。
  */
