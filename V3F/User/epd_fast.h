@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-/* 2.0 inch 200x200 SSD1681, black and white only.
+/* 1.54 inch 152x152 SSD1680, black and white only.
  *
- * Frame format: 25 bytes per row, 5000 bytes, MSB is the leftmost pixel,
+ * Frame format: 19 bytes per row, 2888 bytes, MSB is the leftmost pixel,
  * bit 1 = WHITE and bit 0 = BLACK.
  *
  *   默认使用SPI1。在V303和H417上都是
@@ -13,10 +13,10 @@
  *   MOSI PA7  SPI1
  *   其他接线参考.c文件
  *
- * 具体引脚宏在 epd_fast.c 顶部的「移植区」里，换板子改那里即可。
+ * 具体引脚宏在 epd_fast_net.c 顶部的「移植区」里，换板子改那里即可。
  */
-#define EPD_W 200
-#define EPD_H 200
+#define EPD_W 152
+#define EPD_H 152
 #define EPD_STRIDE (EPD_W / 8)
 #define EPD_FRAME_BYTES (EPD_STRIDE * EPD_H)
 

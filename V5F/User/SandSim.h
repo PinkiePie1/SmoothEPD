@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* 墨水屏 200x200，粒子按 4x4 像素画，模拟区占中间 128x128 */
+/* 墨水屏 152x152，粒子按 4x4 像素画，128x128 模拟区位于左上角 */
 #define NumberOfParticles 2500U
 #define ParticleRadius 0.018f
 #define Spacing 0.045f

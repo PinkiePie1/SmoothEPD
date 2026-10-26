@@ -1,7 +1,7 @@
 /* CH32H417 双核 —— V5F（内容生成：2D 流体模拟）
  *
  * 64x64 网格、2500 个粒子的 PIC/FLIP 流体（SandSim.c）。
- * 每个粒子画成 4x4 像素，整块 128x128 居中放在 200x200 的墨水屏上。
+ * 每个粒子画成 4x4 像素，128x128 模拟区贴着屏幕左上角显示。
  *
  * 本核只负责算和画，画完的内容进共享内存，V3F负责刷屏。
 
@@ -21,22 +21,22 @@
                                                 * 所以相邻格子重叠 2 像素，缝隙被完全封住 */
 #define DRAW_W    ((int)CellNumX * GRID_PX)    /* 128 */
 #define DRAW_H    ((int)CellNumY * GRID_PX)    /* 128 */
-#define DRAW_X    ((EPD_W - DRAW_W) / 2)       /* 居中偏移 36 */
-#define DRAW_Y    ((EPD_H - DRAW_H) / 2)
+#define DRAW_X    0
+#define DRAW_Y    0
 
-/* 底部左侧加速度箭头、右侧两行一位小数帧率。 */
+/* 右侧竖条放加速度箭头，底部右侧放两行一位小数帧率。 */
 #define FPS_CHARS  7                                /* V5:54.5 共 7 个字符 */
 #define FPS_X      (EPD_W - FPS_CHARS * (FONT_W + 1) - 4)
-#define FPS_Y1     (DRAW_Y + DRAW_H + 4)
-#define FPS_Y2     (FPS_Y1 + FONT_H + 4)
-#define ARROW_CX   24
-#define ARROW_CY   ((FPS_Y1 + FPS_Y2 + FONT_H) / 2)
+#define FPS_Y1     (EPD_H - 2 * FONT_H)
+#define FPS_Y2     (FPS_Y1 + FONT_H)
+#define ARROW_CX   (EPD_W - 15)
+#define ARROW_CY   (DRAW_H / 2)
 
 /* 假加速度序列 */
 #define ACCEL_CYCLE_MS   (24u * 1000u)
 #define ACCEL_A          6.8f
 
-#define SIM_RUN_MS      120000u   /* 仿真时长*/
+#define SIM_RUN_MS      2*3600000u   /* 仿真时长*/
 
 #define SIM_PUSH_ITER   2
 #define SIM_GRID_ITER   14
@@ -139,13 +139,13 @@ static void draw_accel_arrow(float ax, float ay)
 
     const float ux = ax / magnitude;
     const float uy = ay / magnitude;
-    const float half_len = 4.0f + 5.0f * strength;
+    const float half_len = 3.0f + 4.0f * strength;
     const int x0 = round_coord((float)ARROW_CX - ux * half_len);
     const int y0 = round_coord((float)ARROW_CY - uy * half_len);
     const int xt = round_coord((float)ARROW_CX + ux * half_len);
     const int yt = round_coord((float)ARROW_CY + uy * half_len);
-    const float head_len = 3.0f + 2.0f * strength;
-    const float wing = 2.0f + strength;
+    const float head_len = 2.0f + 2.0f * strength;
+    const float wing = 1.5f + strength;
     const int xh0 = round_coord((float)xt - ux * head_len - uy * wing);
     const int yh0 = round_coord((float)yt - uy * head_len + ux * wing);
     const int xh1 = round_coord((float)xt - ux * head_len + uy * wing);

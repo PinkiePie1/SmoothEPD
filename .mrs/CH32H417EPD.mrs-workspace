@@ -14,7 +14,7 @@
 	],
 	"settings": {
 		"mrs.workspace.type": "solution",
-		"mrs.workspace.slnLoaded": "C:\\Users\\TheCong\\Downloads\\CH32H417EPD\\CH32H417EPD.wvsln",
+		"mrs.workspace.slnLoaded": "D:\\repos\\SmoothEPD\\CH32H417EPD.wvsln",
 		"mrs.init.arg": "",
 		"files.associations": {
 			"*.c": "c",

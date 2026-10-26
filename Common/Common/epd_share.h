@@ -22,10 +22,10 @@
 #define EPD_SHARE_ADDR   0x20170000u          /* 放在 V3F 的 RAM 里，两核共享 */
 #define EPD_SHARE_MAGIC  0x45504432u          /* 'EPD2' */
 
-//#define EPD_W            200
-//#define EPD_H            200
-//#define EPD_STRIDE       25                   /* 每行 200 像素 = 25 字节 */
-//#define EPD_FRAME_BYTES  (25 * EPD_H) /* 5000 */
+//#define EPD_W            152
+//#define EPD_H            152
+//#define EPD_STRIDE       19                   /* 每行 152 像素 = 19 字节 */
+//#define EPD_FRAME_BYTES  (19 * EPD_H) /* 2888 */
 
 typedef struct
 {
