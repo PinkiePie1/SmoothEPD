@@ -343,7 +343,6 @@ void fluidDemo(void)
         ParticleIntegrate(ax, ay);
         PushParticlesApart(SIM_PUSH_ITER);
         particles_to_grid();
-        density_update();
         compute_grid_forces(SIM_GRID_ITER);
         grid_to_particles();
 
