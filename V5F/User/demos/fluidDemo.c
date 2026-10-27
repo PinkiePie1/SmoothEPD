@@ -15,6 +15,7 @@
 #include "SandSim.h"
 #include "font_fixedsys.h"   /* Fixedsys 8x10 点阵 */
 #include "fluidDemo.h"
+#include "LIS2DH.h"
 
 #define GRID_PX   2                            /* 每个网格 2x2 像素 */
 #define CELL_PX   4                            /* 每格画 4x4 像素：格子间距还是 2 像素，
@@ -32,14 +33,25 @@
 #define ARROW_CX   (EPD_W - 15)
 #define ARROW_CY   (DRAW_H / 2)
 
-/* 假加速度序列 */
-#define ACCEL_CYCLE_MS   (24u * 1000u)
+/* 加速度计换算：读数 mg → 仿真加速度单位。
+ * 1 g（1000 mg）对应原来的幅值 ACCEL_A；XY 方向要反相就改下面的符号宏。 */
 #define ACCEL_A          6.8f
+#define ACCEL_X_SIGN     (1.0f)
+#define ACCEL_Y_SIGN     (1.0f)
+#define ACCEL_MG_TO_SIM  (ACCEL_A / 1000.0f)
+
+/* 运动检测：整数 mg 上做一阶 IIR 低通估重力基线（lpf = 新值>>1 + 旧值>>1），
+ * 读数偏离基线超过阈值就算在动；阈值按静止噪声（约 ±10 mg）留足余量。 */
+#define ACCEL_MOTION_MG  60          /* mg，整数比较，不走浮点 */
+#define ACCEL_IDLE_MS    10000u      /* 静止超过 10 秒就切回假加速度 */
+
+/* 假加速度序列：初始化失败或长时间静止时用来维持演示效果 */
+#define ACCEL_CYCLE_MS   (24u * 1000u)
 
 #define SIM_RUN_MS      2*3600000u   /* 仿真时长*/
 
 #define SIM_PUSH_ITER   2
-#define SIM_GRID_ITER   14
+#define SIM_GRID_ITER   8
 
 static uint8_t frame[EPD_FRAME_BYTES] __attribute__((aligned(4)));
 
@@ -216,6 +228,32 @@ static void render_particles(void)
     }
 }
 
+/* 原来的假加速度序列：8 秒左、2 秒右、2 秒上、2 秒下，之后 8 秒画圆 */
+static void fake_accel(uint32_t ms, float *ax, float *ay)
+{
+    const uint32_t cyc = ms % ACCEL_CYCLE_MS;
+
+    if (cyc < 8u * 1000u) {
+        *ax = -ACCEL_A;                 /* 向左 */
+        *ay = 0.0f;
+    } else if (cyc < 10u * 1000u) {
+        *ax = ACCEL_A;                  /* 向右 */
+        *ay = 0.0f;
+    } else if (cyc < 12u * 1000u) {
+        *ax = 0.0f;
+        *ay = -ACCEL_A;                 /* 向上（y 向下为正） */
+    } else if (cyc < 14u * 1000u) {
+        *ax = 0.0f;
+        *ay = ACCEL_A;                  /* 向下 */
+    } else {
+        const float ang = (float)(cyc - 4u * 1000u) *
+                          (6.2831853f / 8000.0f);
+
+        *ax = ACCEL_A * sinf(ang);
+        *ay = ACCEL_A * cosf(ang);
+    }
+}
+
 void fluidDemo(void)
 {
     uint32_t n = 0;
@@ -223,12 +261,28 @@ void fluidDemo(void)
     uint32_t sim_fps_x10 = 0;               /* V5F 自己的仿真帧率 */
     uint32_t fps_n = 0;                 /* 上次统计时的帧计数 */
     uint32_t fps_ms = 0;                /* 上次统计的时刻（毫秒） */
+    LIS2DH_Accel accel = {0, 0, 0};     /* 最近一次加速度计读数（mg） */
+    float ax = 0.0f;                    /* 仿真加速度，由传感器 XY 换算 */
+    float ay = 0.0f;
+    uint8_t accel_ok = 0;
+    int32_t lpf_x = 0;                  /* IIR 低通估出的重力基线（mg，整数） */
+    int32_t lpf_y = 0;
+    uint8_t lpf_ready = 0;
+    uint32_t last_motion_ms = 0;        /* 最近一次检测到运动的时刻 */
 
     SystemAndCoreClockUpdate();
     Delay_Init();
     PRINT_INIT();                       /* 走 IPC，由 V3F 的 USART1 打出来 */
     epd_share_init();
     EPD_TickInit();                      //初始化时基。其实只是给V5F的demo用，驱动用不到这个。
+
+    /* 加速度计：XY 读数驱动流体，换算与方向见文件顶部的宏 */
+    if (LIS2DH_Init() == 0) {
+        accel_ok = 1;
+        PRINT("[V5F] LIS2DH12 ok, addr=0x%02X\r\n", (unsigned)LIS2DH_Address());
+    } else {
+        PRINT("[V5F] LIS2DH12 init failed, fluid runs without tilt\r\n");
+    }
 
     InitParticles();                    
     t0 = EPD_Millis();
@@ -240,31 +294,44 @@ void fluidDemo(void)
           (unsigned)NumberOfParticles, (int)DRAW_W, (int)DRAW_H);
 
     while ((uint32_t)(EPD_Millis() - t0) < SIM_RUN_MS) {
-        /* 假加速度（板子没有加速度计）：用真实时钟驱动一段演示序列
-         * 然后 12 秒循环。幅值取 9.8，和重力一样。 */
-        const uint32_t ms = (uint32_t)(EPD_Millis() - t0);
-        const uint32_t cyc = ms % ACCEL_CYCLE_MS;
-        float ax;
-        float ay;
+        const uint32_t loop_ms = (uint32_t)(EPD_Millis() - t0);
+        int32_t raw_x = (int32_t)accel.x;
+        int32_t raw_y = (int32_t)accel.y;
+        uint8_t raw_fresh = 0;
 
-        if (cyc < 8u * 1000u) {
-            ax = -ACCEL_A;                  /* 向左 */
-            ay = 0.0f;
-        } else if (cyc < 10u * 1000u) {
-            ax = ACCEL_A;                   /* 向右 */
-            ay = 0.0f;
-        } else if (cyc < 12u * 1000u) {
-            ax = 0.0f;
-            ay = -ACCEL_A;                  /* 向上（y 向下为正） */
-        } else if (cyc < 14u * 1000u) {
-            ax = 0.0f;
-            ay = ACCEL_A;                   /* 向下 */
-        } else {
-            const float ang = (float)(cyc - 4u * 1000u) *
-                              (6.2831853f / (float)8000u);
+        /* 检测加速度 */
+        if ((accel_ok != 0u) && (LIS2DH_Read(&accel) == 0)) {
+            int32_t dx;
+            int32_t dy;
 
-            ax = ACCEL_A * (float)sin((double)ang);
-            ay = ACCEL_A * (float)cos((double)ang);
+            raw_x = (int32_t)accel.x;
+            raw_y = (int32_t)accel.y;
+            raw_fresh = 1;
+
+            if (lpf_ready == 0u) {
+                lpf_x = raw_x;
+                lpf_y = raw_y;
+                lpf_ready = 1;
+            } else {
+                lpf_x = (raw_x >> 1) + (lpf_x >> 1);
+                lpf_y = (raw_y >> 1) + (lpf_y >> 1);
+            }
+
+            dx = raw_x - lpf_x;
+            dy = raw_y - lpf_y;
+            if ((dx > ACCEL_MOTION_MG) || (dx < -ACCEL_MOTION_MG) ||
+                (dy > ACCEL_MOTION_MG) || (dy < -ACCEL_MOTION_MG)) {
+                last_motion_ms = loop_ms;
+            }
+        }
+
+        /* 判断全部结束，到这里才把 mg 整数换算成仿真用的浮点加速度 */
+        if ((accel_ok == 0u) ||
+            ((uint32_t)(loop_ms - last_motion_ms) > ACCEL_IDLE_MS)) {
+            fake_accel(loop_ms, &ax, &ay);
+        } else if (raw_fresh != 0u) {
+            ax = (float)raw_x * ACCEL_MG_TO_SIM * ACCEL_X_SIGN;
+            ay = (float)raw_y * ACCEL_MG_TO_SIM * ACCEL_Y_SIGN;
         }
 
         //流体模拟的主循环。
@@ -282,7 +349,7 @@ void fluidDemo(void)
         draw_rate(FPS_X, FPS_Y2, '3', EPD_SHARE->cons_fps);
 
         EPD_FastFrame(frame);           //发布到共享内存
-        Delay_Ms(7);//等一会，不跑太快。
+        //Delay_Ms(3);//大概会丢掉很多帧，但为了效果好
 
         /* 统计自己的仿真帧率：每满 1 秒算一次 */
         ++n;

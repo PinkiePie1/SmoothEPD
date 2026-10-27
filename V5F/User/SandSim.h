@@ -7,13 +7,13 @@
 #include <string.h>
 
 /* 墨水屏 152x152，粒子按 4x4 像素画，128x128 模拟区位于左上角 */
-#define NumberOfParticles 2500U
-#define ParticleRadius 0.018f
-#define Spacing 0.045f
+#define NumberOfParticles 2000U
+#define ParticleRadius 0.022f
+#define Spacing 0.05f
 #define CellNumX 64U
 #define CellNumY 64U
 #define CellCount (CellNumX * CellNumY)
-#define dt 0.010f //粒子慢一点，给足够时间刷白刷黑
+#define dt 0.01f 
 #define BOUNCYNESS -0.9f
 
 #define overRelaxiation 1.9f

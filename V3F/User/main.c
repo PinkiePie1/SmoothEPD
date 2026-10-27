@@ -78,6 +78,8 @@ int main(void)
     printf("\r\n[V3F] boot, SystemClk=%u, HCLK=%u\r\n",
            (unsigned)SystemClock, (unsigned)HCLKClock);
 
+    PWR->CTLR |= PWR_CTLR_VSEL_VIO18_MODE7|PWR_CTLR_VIO_SWCR;// turn off VIO18 power.
+
     epd_share_init();
     app_tick_init();
     EPD_Hal_Init();
