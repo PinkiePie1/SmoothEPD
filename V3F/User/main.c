@@ -105,13 +105,10 @@ int main(void)
                 //如果没有发新帧，看看多久没发新帧了，如果超过两秒就停手清屏。
                 //如果希望它持续显示的话，V5应该一直发同一帧。
                 if (started && (ms_since(t_last) >= EPD_IDLE_MS)) {
-                    const uint32_t last_idx = (EPD_SHARE->read_seq - 1u) & 1u;
-
                     printf("[V3F] producer idle %u ms, finishing\r\n",
                            (unsigned)ms_since(t_last));
 
-                    memcpy(shown, (const uint8_t *)EPD_SHARE->frame[last_idx],
-                           EPD_FRAME_BYTES);
+                    /* shown 是上一帧的本地快照；共享槽可能已经被 V5F 复用 */
                     EPD_SendDisplay(shown);     // 全刷
                     if (EPD_TakeTimeoutFlag()) {
                         printf("[V3F] final full refresh failed\r\n");
@@ -125,6 +122,7 @@ int main(void)
 
                         while (ms_since(t_blank) < EPD_BLANK_DELAY_MS) {
                             v5con_poll(); //转发V5日志。
+                            EPD_SleepUs(2000);   /* 等 10 秒期间也让 CPU 睡 */
                         }
                     }
 
@@ -149,22 +147,28 @@ int main(void)
 finish_halt:
                     for (;;) {
                         v5con_poll();
+                        EPD_SleepUs(10000);
                     }
                 }
+                /* 没有新帧：WFI 等 2 ms；新帧的 IPC 中断会立刻把 CPU 叫醒 */
+                EPD_SleepUs(2000);
                 continue;  //没有新帧，但也没到等待时间，回去继续等。
             }
 
             t_last = app_tick_now();
 
+            // 先取到本地快照，再立刻把共享槽还给 V5F 并唤醒它。
+            // 后面的等 BUSY / 送 SPI / 全刷都只读本地的 shown，
+            // V5F 可以同时往另一块缓冲里算下一帧。
+            memcpy(shown, next, EPD_FRAME_BYTES);
+            epd_share_release();
+
             //如果是第一帧的话，先全刷一下再进快速模式。
             if (!started) {
-                memcpy(shown, next, EPD_FRAME_BYTES);
                 if (epd_restart_fast(shown) != 0) {
                     printf("[V3F] EPD init timeout, retrying\r\n");
-                    epd_share_release();
                     continue;
                 }
-                epd_share_release();//告诉V5共享内存已被读取，可以写了
 
                 started = 1;
                 printf("[V3F] first frame in, fast mode ready\r\n");
@@ -175,16 +179,14 @@ finish_halt:
 
             // 正常帧：整条显示流水线都在这里
             // 显示就是不断调用这个函数，往里面塞新帧就行了
-            (void)EPD_FastFrame(next);
+            (void)EPD_FastFrame(shown);
             //超时重启
             if (EPD_TakeTimeoutFlag()) {
-                memcpy(shown, next, EPD_FRAME_BYTES);
                 printf("[V3F] EPD timeout, recovering\r\n");
                 if (epd_restart_fast(shown) != 0) {
                     printf("[V3F] EPD recovery failed\r\n");
                 }
             }
-            epd_share_release();
             ++n_report;
 
             //这块是FPS统计。

@@ -94,7 +94,6 @@ void EPD_SetPulseBudget(uint8_t black, uint8_t white)
 //否则很容易电荷不平衡，尤其是高速运动的细线
 //对于此类内容，需要降低运动速度，减少全刷间隔等措施
 
-uint8_t first = 0;
 int EPD_FastFrame(const uint8_t *image)
 {
     uint8_t *slot = epd_share_begin();
@@ -105,11 +104,6 @@ int EPD_FastFrame(const uint8_t *image)
         ++s_scan_count;
     }
 
-    if(first == 0){
-        first = 1;
-        Delay_Ms(2800); //第一帧等一下，让那边全刷完了再开始
-    }
-    
     return 0;
 }
 

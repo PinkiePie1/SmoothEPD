@@ -32,6 +32,9 @@ void EPD_Dat(uint8_t dat);
 void EPD_DelayUs(uint32_t us);
 void EPD_DelayMs(uint32_t ms);
 
+/* 低功耗等待：WFI，SysTick0 定时唤醒；任意中断也会提前唤醒。 */
+void EPD_SleepUs(uint32_t us);
+
 /* ---------------------------------------------------------------- setup */
 
 void EPD_Hal_Init(void);

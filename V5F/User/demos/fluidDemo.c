@@ -294,6 +294,11 @@ void fluidDemo(void)
           (unsigned)NumberOfParticles, (int)DRAW_W, (int)DRAW_H);
 
     while ((uint32_t)(EPD_Millis() - t0) < SIM_RUN_MS) {
+        /* 第一帧直接算；之后每帧提交完先睡，等 V3F 取走上一帧再算下一帧。 */
+        if (n != 0u) {
+            epd_share_wait_consumed();
+        }
+
         const uint32_t loop_ms = (uint32_t)(EPD_Millis() - t0);
         int32_t raw_x = (int32_t)accel.x;
         int32_t raw_y = (int32_t)accel.y;
@@ -348,8 +353,7 @@ void fluidDemo(void)
         draw_rate(FPS_X, FPS_Y1, '5', sim_fps_x10);
         draw_rate(FPS_X, FPS_Y2, '3', EPD_SHARE->cons_fps);
 
-        EPD_FastFrame(frame);           //发布到共享内存
-        //Delay_Ms(3);//大概会丢掉很多帧，但为了效果好
+        EPD_FastFrame(frame);           //发布到共享内存，然后等 V3F 取走
 
         /* 统计自己的仿真帧率：每满 1 秒算一次 */
         ++n;

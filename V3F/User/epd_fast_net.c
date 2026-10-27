@@ -411,33 +411,100 @@ static uint8_t s_hold_pending;  /* a scan drove something and still needs its HO
 
 /* ------------------------------------------------------------ 等待 BUSY
  *
- * 两种等法：
- *   EPD_WFI = 1  进 WFI 睡觉，BUSY 引脚的下降沿（一次波形结束）通过 EXTI 把它唤醒。
- *                一帧里大约 20 ms 都在这里睡，是最省电的一段。
- *   EPD_WFI = 0  忙等（排查用）。
+ * EPD_WFI = 1：BUSY 高电平期间进 WFI，BUSY 下降沿（一次波形结束）通过 EXTI 唤醒。
+ * 一帧里大约 20 ms 都在这里睡，是最省电的一段。
  *
- * 注意：睡眠期间只能靠中断醒来，所以 BUSY 必须真的会跳变。为此 BUSY 引脚配成
- * **下拉输入** —— 面板没接时读到低电平（不忙），不会睡死。
+ * 超时用 SysTick0 的比较中断做，不再靠轮询次数累加：
+ *   - SysTick0 同时是系统的自由运行时基（CNT 只受计数器影响，不受 CMP/IE 影响）
+ *   - 每次只装一个一次性比较值，醒来后马上关掉比较中断
+ *   - 任意中断（BUSY、IPC、其它）都能提前唤醒，外层重新判断并重装
  */
-#define EPD_WFI                 0
+#define EPD_WFI                 1
 
-/* 超时按"轮询多少次"算一次轮询几条指令 移植的时候考虑根据单片机的速度可以改这里的参数*/
-#define EPD_BUSY_POLLS_LONG     200000000u   /* 复位 / LUT / 升压 / 全刷（最长 1.3 秒） */
-#define EPD_BUSY_POLLS_SCAN     20000000u    /* 一次快刷扫描（面板 20 ms） */
+/* BUSY 超时（单位：微秒）。正常快刷扫描 20~26 ms，全刷约 1.3 s；
+ * 这里只作为面板卡死时的保护，不参与正常节拍。 */
+#define EPD_BUSY_POLLS_LONG     4000000u   /* 4 s：复位 / LUT / 升压 / 全刷 */
+#define EPD_BUSY_POLLS_SCAN     300000u    /* 300 ms：一次快刷扫描 */
 
 /* 最近一次等待是否超时：面板卡住时上层可以做一次硬复位恢复 */
 static uint8_t s_busy_timeout;
-static void epd_wait(uint32_t max_polls)
+
+void SysTick0_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void SysTick0_Handler(void)
 {
+    if ((SysTick0->ISR & 1u) != 0u) {
+        SysTick0->ISR &= ~1u;
+    }
+}
+
+/* HCLK 计数换算成 SysTick 计数 */
+static uint32_t epd_us_to_ticks(uint32_t us)
+{
+    uint64_t ticks = (uint64_t)us * HCLKClock / 1000000u;
+
+    if (ticks == 0u) {
+        ticks = 1u;
+    }
+    return (uint32_t)ticks;
+}
+
+static void epd_timer_ensure(void)
+{
+    static uint8_t ready;
+
+    if (ready != 0u) {
+        return;
+    }
+    ready = 1;
+
+    SysTick0->CTLR |= (1u << 2) | (1u << 0);   /* HCLK 源 + 使能 */
+    SysTick0->ISR &= ~1u;
+    NVIC_ClearPendingIRQ(SysTick0_IRQn);
+    NVIC_SetPriority(SysTick0_IRQn, 1);
+    NVIC_EnableIRQ(SysTick0_IRQn);
+}
+
+/* WFI 到 ticks 个 HCLK 之后，或者被任意中断提前叫醒。
+ * 提前醒没关系，调用方会重新判断条件、按剩余时间重装。 */
+static void epd_sleep_ticks(uint32_t ticks)
+{
+    if (ticks == 0u) {
+        ticks = 1u;
+    }
+
+    epd_timer_ensure();
+
+    SysTick0->ISR &= ~1u;
+    NVIC_ClearPendingIRQ(SysTick0_IRQn);
+    SysTick0->CMP = SysTick0->CNT + ticks;
+    SysTick0->CTLR |= (1u << 1);               /* 打开比较中断 */
+    __WFI();
+    SysTick0->CTLR &= ~(1u << 1);
+    SysTick0->ISR &= ~1u;
+}
+
+/* 低功耗等待：任意中断都会把 CPU 叫醒，适合主循环的空闲等待。 */
+void EPD_SleepUs(uint32_t us)
+{
+    epd_sleep_ticks(epd_us_to_ticks(us));
+}
+
+static void epd_wait(uint32_t timeout_us)
+{
+    uint32_t deadline;
+
+    epd_timer_ensure();
+    deadline = SysTick0->CNT + epd_us_to_ticks(timeout_us);
+
     while (BUSY()) {
-#if EPD_WFI
-        __WFI();            /* 睡到 BUSY 下降沿（EXTI7_0）或其它中断 */
-#endif
-        if (--max_polls == 0u) {
-            s_busy_timeout = 1;     
+        const int32_t remain = (int32_t)(deadline - SysTick0->CNT);
+
+        if (remain <= 0) {
+            s_busy_timeout = 1;
             PRINT("[EPD] busy timeout\r\n");
             return;
         }
+        epd_sleep_ticks((uint32_t)remain);
     }
 }
 
