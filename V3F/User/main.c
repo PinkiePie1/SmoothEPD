@@ -21,23 +21,15 @@
 #define EPD_BLANK_DELAY_MS  10000u  /* 最后一帧全刷后，等多久再刷成白屏 */
 
 
-/*------------初始化时基等函数----------------*/
-static void app_tick_init(void)
-{
-    SysTick0->CTLR = 0;
-    SysTick0->CNT = 0;
-    SysTick0->CMP = 0xFFFFFFFFu;
-    SysTick0->CTLR = (1u << 2) | (1u << 0);
-}
-
+/*------------时基：RTC 在 Stop 下继续走----------------*/
 static uint32_t app_tick_now(void)
 {
-    return SysTick0->CNT;
+    return EPD_TickMs();
 }
 
 static uint32_t ms_since(uint32_t t0)
 {
-    return (uint32_t)(app_tick_now() - t0) / (HCLKClock / 1000u);
+    return (uint32_t)(app_tick_now() - t0);
 }
 
 static int epd_restart_fast(const uint8_t *image)
@@ -81,7 +73,6 @@ int main(void)
     PWR->CTLR |= PWR_CTLR_VSEL_VIO18_MODE7|PWR_CTLR_VIO_SWCR;// turn off VIO18 power.
 
     epd_share_init();
-    app_tick_init();
     EPD_Hal_Init();
     EPD_DelayMs(20);
 
@@ -101,10 +92,16 @@ int main(void)
             const uint8_t *next = epd_share_peek();//看看V5有没有发新帧过来
 
             if (next == 0) {
-                
+                epd_share_kick_producer();
+
                 //如果没有发新帧，看看多久没发新帧了，如果超过两秒就停手清屏。
                 //如果希望它持续显示的话，V5应该一直发同一帧。
                 if (started && (ms_since(t_last) >= EPD_IDLE_MS)) {
+                    epd_share_kick_producer();
+                    EPD_SleepUs(50000);
+                    if (epd_share_peek() != 0) {
+                        continue;
+                    }
                     printf("[V3F] producer idle %u ms, finishing\r\n",
                            (unsigned)ms_since(t_last));
 
@@ -122,7 +119,7 @@ int main(void)
 
                         while (ms_since(t_blank) < EPD_BLANK_DELAY_MS) {
                             v5con_poll(); //转发V5日志。
-                            EPD_SleepUs(2000);   /* 等 10 秒期间也让 CPU 睡 */
+                            EPD_SleepUs(50000);   /* 等 10 秒期间也让 CPU 睡 */
                         }
                     }
 
@@ -147,11 +144,11 @@ int main(void)
 finish_halt:
                     for (;;) {
                         v5con_poll();
-                        EPD_SleepUs(10000);
+                        EPD_SleepUs(50000);
                     }
                 }
-                /* 没有新帧：WFI 等 2 ms；新帧的 IPC 中断会立刻把 CPU 叫醒 */
-                EPD_SleepUs(2000);
+                /* 没有新帧：Stop 睡 50 ms；新帧的 IPC 中断会立刻把 CPU 叫醒 */
+                EPD_SleepUs(50000);
                 continue;  //没有新帧，但也没到等待时间，回去继续等。
             }
 

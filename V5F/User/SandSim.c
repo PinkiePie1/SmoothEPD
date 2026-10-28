@@ -32,38 +32,26 @@ float particleVel[NumberOfParticles * 2];
 static float uVel[CellCount];
 static float vVel[CellCount];
 
-#define SIM_GRID_BYTES       (CellCount * sizeof(float))
-#define SIM_DENSITY_ADDR     0x20142000u
-#define SIM_U_WEIGHT_ADDR    0x2014C000u
-#define SIM_V_WEIGHT_ADDR    0x20156000u
-#define SIM_U_PREV_ADDR      0x20160000u
-#define SIM_INV_S_ADDR       0x20173000u
-#define SIM_NEIGHBOR_ADDR    0x2017C400u
+#define SIM_GRID_BYTES (CellCount * sizeof(float))
 
-static float *const uPrev = (float *)SIM_U_PREV_ADDR;
+static float uPrev[CellCount];
 static float vPrev[CellCount];
-static float *const invSCoeff = (float *)SIM_INV_S_ADDR;
-static uint8_t *const solidNeighbours = (uint8_t *)SIM_NEIGHBOR_ADDR;
-static float *const uWeight = (float *)SIM_U_WEIGHT_ADDR;
-static float *const vWeight = (float *)SIM_V_WEIGHT_ADDR;
-static float *const particleDensity = (float *)SIM_DENSITY_ADDR;
-_Static_assert(SIM_V_WEIGHT_ADDR + SIM_GRID_BYTES <= 0x20170000u,
-               "shared particle buffers exceed the free region");
-static uint8_t cellType[CellCount / 4U];
+static float invSCoeff[CellCount];
+static uint8_t solidNeighbours[CellCount];
+static float uWeight[CellCount];
+static float vWeight[CellCount];
+static float particleDensity[CellCount];
+static uint8_t cellType[CellCount];
 static float particleRestDensity = 0.0f;
 
 static inline uint8_t cell_type_get(uint16_t i)
 {
-    return (cellType[i >> 2] >> (2U * (i & 3U))) & 3U;
+    return cellType[i];
 }
 
 static inline void cell_type_set(uint16_t i, uint8_t value)
 {
-    const uint8_t shift = (uint8_t)(2U * (i & 3U));
-    const uint8_t mask = (uint8_t)(3U << shift);
-
-    cellType[i >> 2] = (uint8_t)((cellType[i >> 2] & (uint8_t)~mask) |
-                                 (uint8_t)(value << shift));
+    cellType[i] = value;
 }
 
 #define SOLID_MASK(i) (CELL_TYPE(i) != SOLID_CELL)
@@ -81,6 +69,7 @@ static uint8_t *const touchState = (uint8_t *)fluidCells;
 
 static uint16_t cellParticleCountPrefix[CellPrefixCountSize];
 static uint16_t particlePosId[NumberOfParticles];
+static uint16_t particleOrderIndex[NumberOfParticles];
 
 
 void printLocation(uint16_t n);
@@ -111,8 +100,7 @@ static inline int floor_to_int_nonneg(float value) {
 }
 
 static void setup_solid_mask(void) {
-    /* 每个 2-bit 格都为 AIR(01)，再覆盖最外圈 SOLID。 */
-    memset(cellType, 0x55, sizeof(cellType));
+    memset(cellType, AIR_CELL, sizeof(cellType));
 
     for (uint16_t x = 0; x < CellNumX; ++x) {
         cell_type_set(INDEX(x, 0), SOLID_CELL);
@@ -121,6 +109,22 @@ static void setup_solid_mask(void) {
     for (uint16_t y = 1; y < CellNumY - 1U; ++y) {
         cell_type_set(INDEX(0, y), SOLID_CELL);
         cell_type_set(INDEX(CellNumX - 1U, y), SOLID_CELL);
+    }
+}
+
+static void setup_pressure_geometry(void) {
+    for (uint16_t x = 1; x < CellNumX - 1U; ++x) {
+        for (uint16_t y = 1; y < CellNumY - 1U; ++y) {
+            const uint16_t center = INDEX(x, y);
+            const uint8_t neighbours = (uint8_t)(SOLID_MASK(INDEX(x - 1U, y)) |
+                                                (SOLID_MASK(INDEX(x + 1U, y)) << 1) |
+                                                (SOLID_MASK(INDEX(x, y - 1U)) << 2) |
+                                                (SOLID_MASK(INDEX(x, y + 1U)) << 3));
+            const float s = (float)((neighbours & 1U) + ((neighbours >> 1) & 1U) +
+                                    ((neighbours >> 2) & 1U) + ((neighbours >> 3) & 1U));
+            solidNeighbours[center] = neighbours;
+            invSCoeff[center] = overRelaxiation / s;
+        }
     }
 }
 
@@ -135,6 +139,7 @@ void InitParticles() {
     memset(particleDensity, 0, SIM_GRID_BYTES);
     particleRestDensity = 0.0f;
     setup_solid_mask();
+    setup_pressure_geometry();
 
     const float h = Spacing;
     const float r = ParticleRadius;
@@ -224,6 +229,7 @@ void PushParticlesApart(uint16_t nIters) {
         uint16_t cellNr = fluidCells[i];
         uint16_t gridIndex = --cellParticleCountPrefix[cellNr];
         particlePosId[gridIndex] = i;
+        particleOrderIndex[i] = gridIndex;
     }
 
     const float minDist  = 2.0f * ParticleRadius;
@@ -241,7 +247,6 @@ void PushParticlesApart(uint16_t nIters) {
             int pxi = clamp_index((int)(px * invertSpacing), 0, (int)CellNumX - 1);
             int pyi = clamp_index((int)(py * invertSpacing), 0, (int)CellNumY - 1);
 
-            int x0 = (pxi > 0) ? pxi - 1 : 0;
             int y0 = (pyi > 0) ? pyi - 1 : 0;
             int x1 = (pxi + 1 < (int)CellNumX) ? pxi + 1 : (int)CellNumX - 1;
             int y1 = (pyi + 1 < (int)CellNumY) ? pyi + 1 : (int)CellNumY - 1;
@@ -254,20 +259,22 @@ void PushParticlesApart(uint16_t nIters) {
              * 同格内再按 id 排序保证只处理一次。候选数直接减半。 */
             const uint16_t icell = (uint16_t)INDEX((uint16_t)pxi, (uint16_t)pyi);
 
-            for (int xi = x0; xi <= x1; xi++) {
-                for (int yi = y0; yi <= y1; yi++) {
+            for (int xi = pxi; xi <= x1; xi++) {
+                const int firstY = (xi == pxi) ? pyi : y0;
+                for (int yi = firstY; yi <= y1; yi++) {
 
                     uint16_t cellNr = INDEX((uint16_t)xi, (uint16_t)yi);
-                    if (cellNr < icell) continue;
 
-                    uint16_t firstIdx = cellParticleCountPrefix[cellNr];
-                    uint16_t lastIdx  = cellParticleCountPrefix[cellNr + 1U];
+                    const uint8_t sameParticleCell = (cellNr == icell) && (fluidCells[i] == icell);
+                    const uint16_t firstIdx = cellParticleCountPrefix[cellNr];
+                    const uint16_t lastIdx = sameParticleCell ? particleOrderIndex[i] :
+                                                                  cellParticleCountPrefix[cellNr + 1U];
 
                     for (uint16_t j = firstIdx; j < lastIdx; j++) {
 
-                        uint16_t id = particlePosId[j];
+                        const uint16_t id = particlePosId[j];
                         if (id == i) continue;
-                        if (cellNr == icell && id < i) continue;
+                        if (!sameParticleCell && (cellNr == icell) && (id < i)) continue;
 
                         float qx = particlePos[XID(id)];
                         float qy = particlePos[YID(id)];
@@ -329,17 +336,11 @@ void PushParticlesApart(uint16_t nIters) {
 
 
 /* 双线性采样几何缓存：坐标和小数都用 uint8_t，小数为 8 位定点数。 */
-#define SIM_GEOM_X_ADDR      0x20130000u
-#define SIM_GEOM_Y_ADDR      0x20133000u
-#define SIM_GEOM_TX_ADDR     0x20136000u
-#define SIM_GEOM_TY_ADDR     0x2013C000u
+typedef struct {
+    uint8_t x, y, tx, ty;
+} BilinGeom;
 
-static uint8_t (*const bilinX)[NumberOfParticles] = (void *)SIM_GEOM_X_ADDR;
-static uint8_t (*const bilinY)[NumberOfParticles] = (void *)SIM_GEOM_Y_ADDR;
-static uint8_t (*const bilinTx)[NumberOfParticles] = (void *)SIM_GEOM_TX_ADDR;
-static uint8_t (*const bilinTy)[NumberOfParticles] = (void *)SIM_GEOM_TY_ADDR;
-_Static_assert(SIM_GEOM_TY_ADDR + 2U * NumberOfParticles * sizeof(uint8_t) <= SIM_DENSITY_ADDR,
-               "geometry buffers overlap density");
+static BilinGeom bilinGeom[2][NumberOfParticles];
 
 static inline uint8_t bilin_q_from_float(float value)
 {
@@ -386,10 +387,11 @@ static void build_bilinear_geom(void)
             const int x0 = clamp_index(floor_to_int_nonneg((x - dx) * h1), 0, (int)CellNumX - 2);
             const int y0 = clamp_index(floor_to_int_nonneg((y - dy) * h1), 0, (int)CellNumY - 2);
 
-            bilinX[c][i] = (uint8_t)x0;
-            bilinY[c][i] = (uint8_t)y0;
-            bilinTx[c][i] = bilin_q_from_float(((x - dx) - x0 * h) * h1);
-            bilinTy[c][i] = bilin_q_from_float(((y - dy) - y0 * h) * h1);
+            BilinGeom *const geom = &bilinGeom[c][i];
+            geom->x = (uint8_t)x0;
+            geom->y = (uint8_t)y0;
+            geom->tx = bilin_q_from_float(((x - dx) - x0 * h) * h1);
+            geom->ty = bilin_q_from_float(((y - dy) - y0 * h) * h1);
         }
     }
 }
@@ -419,10 +421,32 @@ static void restore_boundary_velocity(int component, float *f, const float *prev
     }
 }
 
+static void save_boundary_velocity(int component, const float *f, float *prev)
+{
+    for (uint16_t y = 0; y < CellNumY; ++y) {
+        uint16_t idx = INDEX(0, y);
+        prev[idx] = f[idx];
+        idx = INDEX(CellNumX - 1U, y);
+        prev[idx] = f[idx];
+        if (component == 0) {
+            idx = INDEX(1, y);
+            prev[idx] = f[idx];
+        }
+    }
+    for (uint16_t x = (component == 0) ? 2U : 1U; x < CellNumX - 1U; ++x) {
+        uint16_t idx = INDEX(x, 0);
+        prev[idx] = f[idx];
+        if (component != 0) {
+            idx = INDEX(x, 1);
+            prev[idx] = f[idx];
+        }
+        idx = INDEX(x, CellNumY - 1U);
+        prev[idx] = f[idx];
+    }
+}
+
 void particles_to_grid(void) {
     build_bilinear_geom();   /* 本帧的采样几何只算一次，p2g/g2p 共用 */
-    memcpy(uPrev, uVel, sizeof(uVel));
-    memcpy(vPrev, vVel, sizeof(vVel));
     memset(touchState, 0, CellCount);
 
     setup_solid_mask();
@@ -439,19 +463,21 @@ void particles_to_grid(void) {
     for (int component = 0; component < 2; component++) {
         float *f = (component == 0) ? uVel : vVel;
         float *w = (component == 0) ? uWeight : vWeight;
-        const float *prev = (component == 0) ? uPrev : vPrev;
+        float *prev = (component == 0) ? uPrev : vPrev;
         const uint8_t touch = (uint8_t)(component + 1);
 
+        save_boundary_velocity(component, f, prev);
         for (uint16_t i = 0; i < NumberOfParticles; i++) {
-            int x0 = bilinX[component][i];
-            int y0 = bilinY[component][i];
-            int x1 = x0 + 1;
-            int y1 = y0 + 1;
+            const BilinGeom geom = bilinGeom[component][i];
+            const int x0 = geom.x;
+            const int y0 = geom.y;
+            const int x1 = x0 + 1;
+            const int y1 = y0 + 1;
 
-            float tx = bilin_q_to_float(bilinTx[component][i]);
-            float ty = bilin_q_to_float(bilinTy[component][i]);
-            float sx = 1.0f - tx;
-            float sy = 1.0f - ty;
+            const float tx = bilin_q_to_float(geom.tx);
+            const float ty = bilin_q_to_float(geom.ty);
+            const float sx = 1.0f - tx;
+            const float sy = 1.0f - ty;
 
             float w0 = sx * sy;
             float w1 = tx * sy;
@@ -515,40 +541,22 @@ void compute_grid_forces(uint16_t nIters) {
     memcpy(uPrev, uVel, sizeof(uVel));
     memcpy(vPrev, vVel, sizeof(vVel));
 
-    /* 每帧一次：收集流体格，预计算 overRelaxiation/s */
     fluidCellCount = 0;
     for (uint16_t x = 1; x < CellNumX - 1U; x++) {
         for (uint16_t y = 1; y < CellNumY - 1U; y++) {
-            uint16_t center = INDEX(x, y);
-            if (CELL_TYPE(center) != FLUID_CELL) {
-                continue;
+            const uint16_t center = INDEX(x, y);
+            if (CELL_TYPE(center) == FLUID_CELL) {
+                fluidCells[fluidCellCount++] = center;
             }
-            float sx0 = (float)SOLID_MASK(INDEX(x - 1U, y));
-            float sx1 = (float)SOLID_MASK(INDEX(x + 1U, y));
-            float sy0 = (float)SOLID_MASK(INDEX(x, y - 1U));
-            float sy1 = (float)SOLID_MASK(INDEX(x, y + 1U));
-            float s = sx0 + sx1 + sy0 + sy1;
-            if (s == 0.0f) {
-                continue;
-            }
-            fluidCells[fluidCellCount++] = center;
-            invSCoeff[center] = overRelaxiation / s;
-            solidNeighbours[center] = (uint8_t)(SOLID_MASK(INDEX(x - 1U, y)) |
-                                                (SOLID_MASK(INDEX(x + 1U, y)) << 1) |
-                                                (SOLID_MASK(INDEX(x, y - 1U)) << 2) |
-                                                (SOLID_MASK(INDEX(x, y + 1U)) << 3));
         }
     }
 
     for (uint16_t iter = 0; iter < nIters; iter++) {
         for (uint16_t k = 0; k < fluidCellCount; k++) {
             {
-                uint16_t center = fluidCells[k];
-                uint16_t x = center / CellNumY;
-                uint16_t y = center % CellNumY;
-
-                uint16_t right = INDEX(x + 1U, y);
-                uint16_t top = INDEX(x, y + 1U);
+                const uint16_t center = fluidCells[k];
+                const uint16_t right = center + CellNumY;
+                const uint16_t top = center + 1U;
 
                 const uint32_t neighbours = solidNeighbours[center];
                 float div = uVel[right] - uVel[center] + vVel[top] - vVel[center];
@@ -562,10 +570,17 @@ void compute_grid_forces(uint16_t nIters) {
 
                 const float p = -div * invSCoeff[center];
 
-                uVel[center] -= (neighbours & 1U) * p;
-                uVel[right] += ((neighbours >> 1) & 1U) * p;
-                vVel[center] -= ((neighbours >> 2) & 1U) * p;
-                vVel[top] += ((neighbours >> 3) & 1U) * p;
+                if (neighbours == 0x0FU) {
+                    uVel[center] -= p;
+                    uVel[right] += p;
+                    vVel[center] -= p;
+                    vVel[top] += p;
+                } else {
+                    uVel[center] -= (neighbours & 1U) * p;
+                    uVel[right] += ((neighbours >> 1) & 1U) * p;
+                    vVel[center] -= ((neighbours >> 2) & 1U) * p;
+                    vVel[top] += ((neighbours >> 3) & 1U) * p;
+                }
             }
         }
     }
@@ -580,15 +595,16 @@ void grid_to_particles(void) {
         int offset = (component == 0) ? (int)CellNumY : 1;
 
         for (uint16_t i = 0; i < NumberOfParticles; i++) {
-            int x0 = bilinX[component][i];
-            int y0 = bilinY[component][i];
-            int x1 = x0 + 1;
-            int y1 = y0 + 1;
+            const BilinGeom geom = bilinGeom[component][i];
+            const int x0 = geom.x;
+            const int y0 = geom.y;
+            const int x1 = x0 + 1;
+            const int y1 = y0 + 1;
 
-            float tx = bilin_q_to_float(bilinTx[component][i]);
-            float ty = bilin_q_to_float(bilinTy[component][i]);
-            float sx = 1.0f - tx;
-            float sy = 1.0f - ty;
+            const float tx = bilin_q_to_float(geom.tx);
+            const float ty = bilin_q_to_float(geom.ty);
+            const float sx = 1.0f - tx;
+            const float sy = 1.0f - ty;
 
             float d0 = sx * sy;
             float d1 = tx * sy;

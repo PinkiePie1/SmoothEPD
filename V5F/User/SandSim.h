@@ -13,8 +13,8 @@
 #define CellNumX 64U
 #define CellNumY 64U
 #define CellCount (CellNumX * CellNumY)
-#define dt 0.01f 
-#define BOUNCYNESS -0.9f
+#define dt 0.02f 
+#define BOUNCYNESS -0.5f
 
 #define overRelaxiation 1.9f
 #define stiffnessCoefficient 1.2f

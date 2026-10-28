@@ -32,8 +32,11 @@ void EPD_Dat(uint8_t dat);
 void EPD_DelayUs(uint32_t us);
 void EPD_DelayMs(uint32_t ms);
 
-/* 低功耗等待：WFI，SysTick0 定时唤醒；任意中断也会提前唤醒。 */
+/* 低功耗等待：Stop 模式，RTC 定时唤醒；任意中断也会提前唤醒。 */
 void EPD_SleepUs(uint32_t us);
+
+/* 自由运行的毫秒时基（RTC，Stop 下继续走）。 */
+uint32_t EPD_TickMs(void);
 
 /* ---------------------------------------------------------------- setup */
 

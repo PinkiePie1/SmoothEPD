@@ -16,37 +16,23 @@
 #include <string.h>
 
 /* ----------------------------------------------------------------- 时基
- * 只用来给 demo 算 elapsed_ms / fps。SysTick0 数的是 HCLK。 */
-static uint32_t s_elapsed_ms;
-static uint32_t s_last_cnt;
-static uint32_t s_frac;
+ * 只用来给 demo 算 elapsed_ms / fps。RTC 由 V3F 初始化成 1 ms 一格，
+ * 在 Stop 下继续走，睡眠期间的时间不会丢。 */
+static uint32_t s_tick_base;
 
 void EPD_TickInit(void)
 {
-    SysTick0->CTLR = 0;
-    SysTick0->CNT = 0;
-    SysTick0->CMP = 0xFFFFFFFFu;
-    SysTick0->CTLR = (1u << 2) | (1u << 0);   /* HCLK 源 + 使能自由运行 */
-    s_last_cnt = SysTick0->CNT;
-    s_elapsed_ms = 0;
-    s_frac = 0;
+    s_tick_base = RTC_GetCounter();
 }
 
 uint32_t EPD_TickNow(void)
 {
-    return SysTick0->CNT;
+    return RTC_GetCounter();
 }
 
 uint32_t EPD_Millis(void)
 {
-    const uint32_t now = EPD_TickNow();
-    const uint32_t delta = now - s_last_cnt;
-    const uint64_t accumulated = (uint64_t)delta * 1000u + s_frac;
-
-    s_last_cnt = now;
-    s_elapsed_ms += (uint32_t)(accumulated / HCLKClock);
-    s_frac = (uint32_t)(accumulated % HCLKClock);
-    return s_elapsed_ms;
+    return (uint32_t)(EPD_TickNow() - s_tick_base);
 }
 
 /* 粗略的毫秒延时：只为驱动初始化和收尾用，精度不敏感 */

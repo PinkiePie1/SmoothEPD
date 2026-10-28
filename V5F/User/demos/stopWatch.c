@@ -399,6 +399,6 @@ void stopWatchDemo(void)
     PRINT("[SW] run finished\r\n");
 
     for (;;) {
-        __WFI();        /* V3F 检测停止产帧后负责全刷、白屏和关屏 */
+        epd_share_sleep();   /* V3F 检测停止产帧后负责全刷、白屏和关屏 */
     }
 }

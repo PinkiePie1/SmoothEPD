@@ -51,8 +51,11 @@ uint8_t *epd_share_begin(void);
 /* 生产者（V5F）：提交这一帧（write_seq++ 并通知 V3F）。 */
 void epd_share_commit(void);
 
-/* 生产者（V5F）：等到 V3F 把已提交的帧取走再继续；内部用 WFI 睡眠。 */
+/* 生产者（V5F）：等到 V3F 把已提交的帧取走再继续；内部进 Stop 睡眠。 */
 void epd_share_wait_consumed(void);
+
+/* 生产者（V5F）：单独一次空闲睡眠（Stop）。收尾死循环也用它。 */
+void epd_share_sleep(void);
 
 /* 生产者统计：因为 V3F 没来得及取而丢掉的帧数。 */
 uint32_t epd_share_dropped(void);
@@ -62,6 +65,9 @@ const uint8_t *epd_share_peek(void);
 
 /* 消费者（V3F）：这一帧用完了，把槽位还回去（read_seq++）并唤醒 V5F。 */
 void epd_share_release(void);
+
+/* 消费者（V3F）：只补发一次唤醒，不改变帧序号，用于丢失唤醒兜底。 */
+void epd_share_kick_producer(void);
 
 /* 两核都要在初始化时调一次（幂等，只清一次）。 */
 void epd_share_init(void);

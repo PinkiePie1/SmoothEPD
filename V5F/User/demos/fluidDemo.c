@@ -1,6 +1,6 @@
 /* CH32H417 双核 —— V5F（内容生成：2D 流体模拟）
  *
- * 64x64 网格、2500 个粒子的 PIC/FLIP 流体（SandSim.c）。
+ * 64x64 网格、2000 个粒子的 PIC/FLIP 流体（SandSim.c）。
  * 每个粒子画成 4x4 像素，128x128 模拟区贴着屏幕左上角显示。
  *
  * 本核只负责算和画，画完的内容进共享内存，V3F负责刷屏。
@@ -36,7 +36,7 @@
 /* 加速度计换算：读数 mg → 仿真加速度单位。
  * 1 g（1000 mg）对应原来的幅值 ACCEL_A；XY 方向要反相就改下面的符号宏。 */
 #define ACCEL_A          6.8f
-#define ACCEL_X_SIGN     (1.0f)
+#define ACCEL_X_SIGN     (-1.0f)
 #define ACCEL_Y_SIGN     (1.0f)
 #define ACCEL_MG_TO_SIM  (ACCEL_A / 1000.0f)
 
@@ -48,7 +48,7 @@
 /* 假加速度序列：初始化失败或长时间静止时用来维持演示效果 */
 #define ACCEL_CYCLE_MS   (24u * 1000u)
 
-#define SIM_RUN_MS      2*3600000u   /* 仿真时长*/
+#define SIM_RUN_MS      (4u * 3600000u)   /* 仿真时长：4 小时 */
 
 #define SIM_PUSH_ITER   2
 #define SIM_GRID_ITER   8
@@ -218,11 +218,14 @@ static void render_particles(void)
         px0 = DRAW_X + cx * GRID_PX;
         py0 = DRAW_Y + cy * GRID_PX;
 
-        for (dy = 0; dy < CELL_PX; ++dy) {
-            int dx;
+        const uint16_t mask = (uint16_t)(0xF000u >> (px0 & 7));
+        const uint32_t column = (uint32_t)(px0 >> 3);
 
-            for (dx = 0; dx < CELL_PX; ++dx) {
-                px(px0 + dx, py0 + dy);
+        for (dy = 0; dy < CELL_PX; ++dy) {
+            const uint32_t offset = (uint32_t)(py0 + dy) * EPD_STRIDE + column;
+            frame[offset] &= (uint8_t)~(mask >> 8);
+            if ((mask & 0xFFu) != 0u) {
+                frame[offset + 1u] &= (uint8_t)~mask;
             }
         }
     }
@@ -375,6 +378,6 @@ void fluidDemo(void)
           (unsigned)(SIM_RUN_MS / 1000u), (unsigned)n);
     
     for (;;) {
-        __WFI();
+        epd_share_sleep();
     }
 }

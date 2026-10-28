@@ -7,9 +7,12 @@
  * 移植区之后是纯驱动逻辑，和具体单片机无关。
  * ==========================================================================*/
 
+#include <string.h>
+
 #include "ch32h417.h"
 #include "print.h"
 #include "epd_fast.h"
+#include "system_ch32h417.h"
 
 /* ============================================================================
  * ============================ 移植区（开始） ================================
@@ -72,6 +75,10 @@
 #define EPD_DMA_TC_CLEAR()  DMA_ClearFlag(DMA1, EPD_DMA_TC_FLAG)
 #define EPD_DMA_MIN_LEN     256                               // 超过这个长度才走 DMA
 
+static volatile uint8_t s_dma_done;
+static void epd_rtc_alarm(uint32_t ms);
+static void epd_rtc_alarm_off(void);
+
 /* 帧率限制：屏幕单帧刷新完成后等这么久才写下一帧。0 = 不限速。 */
 #define EPD_FRAME_HOLD_US   0u
 #define EPD_FRAME_FIXED_US  21260u
@@ -100,7 +107,71 @@ void EPD_DelayMs(uint32_t ms)
     }
 }
 
-/* ----------------------------SPI收发--------------------------------  */
+/* ------------------------------------------------------- 故障定位插桩
+ *
+ * 把每一处可能"无超时死等"的地方都加上边界：等不到就置故障位、记录所在阶段并跳出，
+ * 让系统活着把元凶报出来，而不是整机僵死。
+ */
+#define EPD_FAULT_SPI_TXE     0x0001u
+#define EPD_FAULT_SPI_RXNE    0x0002u
+#define EPD_FAULT_SPI_BSY     0x0004u
+#define EPD_FAULT_RTC_RTOFF   0x0008u
+#define EPD_FAULT_BUSY        0x0010u
+#define EPD_FAULT_CLK_RESTORE 0x0020u
+#define EPD_FAULT_UART_TC     0x0040u
+#define EPD_FAULT_CLK_HSE     0x0080u
+#define EPD_FAULT_CLK_PLL     0x0100u
+#define EPD_FAULT_CLK_SW      0x0200u
+#define EPD_WAIT_GUARD        2000000u
+
+volatile uint32_t g_epd_fault;
+volatile uint32_t g_epd_fault_phase;
+volatile uint32_t g_epd_phase;
+
+void EPD_SetFault(uint32_t bits)
+{
+    const uint32_t before = g_epd_fault;
+
+    g_epd_fault |= bits;
+    if ((before & bits) != bits) {
+        g_epd_fault_phase = g_epd_phase;
+        PRINT("[EPD] STALL f=%04x ph=%u\r\n", (unsigned)bits, (unsigned)g_epd_phase);
+    }
+}
+
+uint32_t EPD_TakeFaultFlags(void)
+{
+    const uint32_t f = g_epd_fault;
+
+    g_epd_fault = 0u;
+    return f;
+}
+
+uint32_t EPD_FaultPhase(void)
+{
+    return g_epd_fault_phase;
+}
+
+/* RTC 写寄存器要等 RTOFF；RTC 一旦没有时钟这里会永远等不到，必须加边界 */
+static void epd_rtc_wait_ready(void)
+{
+    uint32_t guard = 0;
+
+    while ((RTC->CTLRL & RTC_FLAG_RTOFF) == 0u) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_RTC_RTOFF);
+            return;
+        }
+    }
+}
+
+#define RTC_WaitForLastTask()  epd_rtc_wait_ready()
+
+/* Stop 唤醒后的时钟恢复：必须在唤醒中断里立刻做（官方 Stop_Mode 例程即如此），
+ * 否则会有一段代码跑在 HSI 上，而且恢复时机也不可控。 */
+static void epd_clock_restore(void);
+
+
 
 /* 单字节发送 */
 static void spi_byte(uint8_t v)
@@ -145,34 +216,57 @@ void EPD_Dat(uint8_t dat)
  * DMA 计数器 16 位，单次最多 65535 字节 */
 static void epd_dma_send(const uint8_t *buf, uint32_t len)
 {
-    uint32_t guard = 2000000u;
+    const uint32_t deadline = EPD_TickMs() + 5u;
 
+    s_dma_done = 0;
     DMA_Cmd(EPD_DMA_CHANNEL, DISABLE);
     EPD_DMA_TC_CLEAR();
     EPD_DMA_CHANNEL->MADDR = (uint32_t)buf;
     DMA_SetCurrDataCounter(EPD_DMA_CHANNEL, (uint16_t)len);
+    epd_rtc_alarm(5u);
     DMA_Cmd(EPD_DMA_CHANNEL, ENABLE);
 
-    while (!EPD_DMA_TC_READY()) {
-        if (--guard == 0u) {
-            /* DMA 没跑起来就退回轮询，把没发完的部分补上 */
-            const uint32_t left = DMA_GetCurrDataCounter(EPD_DMA_CHANNEL);
-            const uint32_t done = (left <= len) ? (len - left) : len;
+    while ((s_dma_done == 0u) && ((int32_t)(deadline - EPD_TickMs()) > 0)) {
+        GPIO_ResetBits(GPIOB, GPIO_Pin_1);
+        __WFI();
+        GPIO_SetBits(GPIOB, GPIO_Pin_1);
+    }
+    epd_rtc_alarm_off();
 
-            DMA_Cmd(EPD_DMA_CHANNEL, DISABLE);
-            for (uint32_t i = done; i < len; ++i) {
-                spi_byte(buf[i]);
-            }
-            PRINT("[EPD] dma timeout at %u/%u, fell back to polling\r\n",
-                  (unsigned)done, (unsigned)len);
-            return;
+    if ((s_dma_done == 0u) && !EPD_DMA_TC_READY()) {
+        /* DMA 没跑起来就退回轮询，把没发完的部分补上 */
+        const uint32_t left = DMA_GetCurrDataCounter(EPD_DMA_CHANNEL);
+        const uint32_t done = (left <= len) ? (len - left) : len;
+
+        DMA_Cmd(EPD_DMA_CHANNEL, DISABLE);
+        for (uint32_t i = done; i < len; ++i) {
+            spi_byte(buf[i]);
         }
+        PRINT("[EPD] dma timeout at %u/%u, fell back to polling\r\n",
+              (unsigned)done, (unsigned)len);
+        return;
     }
 
     /* DMA 完成时最后一个字节可能还在移位寄存器里 */
-    while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_TXE) == RESET) {
-    }
-    while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_BSY) == SET) {
+    {
+        uint32_t guard = 0;
+
+        g_epd_phase = 2u;
+        while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_TXE) == RESET) {
+            if (++guard >= EPD_WAIT_GUARD) {
+                EPD_SetFault(EPD_FAULT_SPI_TXE);
+                break;
+            }
+        }
+        guard = 0;
+        g_epd_phase = 3u;
+        while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_BSY) == SET) {
+            if (++guard >= EPD_WAIT_GUARD) {
+                EPD_SetFault(EPD_FAULT_SPI_BSY);
+                break;
+            }
+        }
+        g_epd_phase = 1u;
     }
 
     DMA_Cmd(EPD_DMA_CHANNEL, DISABLE);
@@ -181,6 +275,15 @@ static void epd_dma_send(const uint8_t *buf, uint32_t len)
     /* SPI传完要读一下接收 */
     (void)SPI1->DATAR;
     (void)SPI1->STATR;
+}
+
+void DMA1_Channel3_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void DMA1_Channel3_IRQHandler(void)
+{
+    if (EPD_DMA_TC_READY()) {
+        s_dma_done = 1;
+        EPD_DMA_TC_CLEAR();
+    }
 }
 
 /* 数据阶段（CS 保持低电平）：长块走 DMA，短块逐字节 */
@@ -200,12 +303,14 @@ static void epd_dat_buf(const uint8_t *buf, uint32_t len)
 
 /* ------------------------------------------------------------ 硬件初始化 */
 
-void EPD_Hal_Init(void)
+static void epd_rtc_ensure(void);
+
+static void epd_hw_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
     SPI_InitTypeDef spi = {0};
 
-    RCC_HB2PeriphClockCmd(RCC_HB2Periph_AFIO | RCC_HB2Periph_GPIOA |
+    RCC_HB2PeriphClockCmd(RCC_HB2Periph_AFIO | RCC_HB2Periph_GPIOA | RCC_HB2Periph_GPIOB |
                           RCC_HB2Periph_GPIOC | RCC_HB2Periph_GPIOE, ENABLE);
 
     /* CS / DC / RST 输出 */
@@ -213,6 +318,13 @@ void EPD_Hal_Init(void)
     gpio.GPIO_Speed = EPD_GPIO_SPEED;
     gpio.GPIO_Mode = GPIO_Mode_Out_PP;
     GPIO_Init(EPD_CS_PORT, &gpio);
+
+    /* 示波器观察用：唤醒高、Stop/WFI 睡眠低（PB1） */
+    gpio.GPIO_Pin = GPIO_Pin_1;
+    gpio.GPIO_Speed = GPIO_Speed_Very_High;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_Init(GPIOB, &gpio);
+    GPIO_SetBits(GPIOB, GPIO_Pin_1);
 
     /* BUSY 输入下拉 */
     gpio.GPIO_Pin = EPD_BUSY_PIN;
@@ -279,14 +391,25 @@ void EPD_Hal_Init(void)
         dma.DMA_BufferMode = DMA_SingleBufferMode;
         DMA_Init(EPD_DMA_CHANNEL, &dma);
     }
+    DMA_ITConfig(EPD_DMA_CHANNEL, DMA_IT_TC, ENABLE);
+    NVIC_SetPriority(DMA1_Channel3_IRQn, 1);
+    NVIC_EnableIRQ(DMA1_Channel3_IRQn);
     SPI_I2S_DMACmd(SPI1, SPI_I2S_DMAReq_Tx, ENABLE);
 }
 
-/* BUSY 引脚的 EXTI 中断：只清标志，作用是让 epd_wait() 里的 WFI 醒过来。
- * 真正的判断还在 epd_wait() 里读引脚，所以这里不做任何业务逻辑。 */
+void EPD_Hal_Init(void)
+{
+    epd_hw_init();
+    epd_rtc_ensure();
+}
+
+/* BUSY 引脚的 EXTI 中断：Stop 就靠它唤醒。
+ * 唤醒后先恢复 VDDK + 时钟（官方例程在中断里做），再清标志。 */
 void EXTI7_0_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void EXTI7_0_IRQHandler(void)
 {
+    epd_clock_restore();
+
     if (EXTI_GetITStatus(EPD_BUSY_EXTI_LINE) != RESET) {
         EXTI_ClearITPendingBit(EPD_BUSY_EXTI_LINE);
     }
@@ -400,8 +523,14 @@ static uint8_t s_fast_frames = EPD_FAST_FRAMES;
 
 /* 黑方向脉冲数减白方向脉冲数，限制在 [-7,+7]。 */
 static int8_t s_net[EPD_PIXELS];
+static int8_t s_net_next[EPD_PIXELS];
 static uint8_t s_mask_black[EPD_FRAME_BYTES];
 static uint8_t s_mask_white[EPD_FRAME_BYTES];
+static uint8_t s_target[EPD_FRAME_BYTES];
+static uint8_t s_active[EPD_FRAME_BYTES];
+static uint8_t s_active_next[EPD_FRAME_BYTES];
+static uint16_t s_planned_pixels[EPD_FRAME_BYTES];
+static uint16_t s_planned_count;
 
 static uint32_t s_scan_count;   /* fast scans since the last full refresh */
 static uint8_t  s_pending;      /* 已经激活、面板还在刷 */
@@ -411,15 +540,16 @@ static uint8_t s_hold_pending;  /* a scan drove something and still needs its HO
 
 /* ------------------------------------------------------------ 等待 BUSY
  *
- * EPD_WFI = 1：BUSY 高电平期间进 WFI，BUSY 下降沿（一次波形结束）通过 EXTI 唤醒。
+ * Stop 模式：BUSY 高电平期间 CPU 进 Stop，BUSY 下降沿（一次波形结束）通过 EXTI 唤醒。
  * 一帧里大约 20 ms 都在这里睡，是最省电的一段。
  *
- * 超时用 SysTick0 的比较中断做，不再靠轮询次数累加：
- *   - SysTick0 同时是系统的自由运行时基（CNT 只受计数器影响，不受 CMP/IE 影响）
- *   - 每次只装一个一次性比较值，醒来后马上关掉比较中断
- *   - 任意中断（BUSY、IPC、其它）都能提前唤醒，外层重新判断并重装
+ * Stop 以后 HCLK 停摆，SysTick 不再计数，所以睡眠定时和 BUSY 超时都改用 RTC：
+ *   - RTC 走 LSI，Stop 期间继续计数
+ *   - 预分频后计数单位 1 ms，既当睡眠闹钟，也当 BUSY 超时
+ *   - 每次进 Stop 前都装一个 RTC 闹钟，BUSY 一直不落也能按时醒来查超时
  */
-#define EPD_WFI                 1
+#define EPD_RTC_PRESCALER_LSI   39u        /* LSI 40 kHz / 40 = 1 kHz，1 tick ≈ 1 ms */
+#define EPD_LSI_WAIT_LOOPS      20000000u  /* LSI 起振等待上限，超时也继续往下走 */
 
 /* BUSY 超时（单位：微秒）。正常快刷扫描 20~26 ms，全刷约 1.3 s；
  * 这里只作为面板卡死时的保护，不参与正常节拍。 */
@@ -428,84 +558,311 @@ static uint8_t s_hold_pending;  /* a scan drove something and still needs its HO
 
 /* 最近一次等待是否超时：面板卡住时上层可以做一次硬复位恢复 */
 static uint8_t s_busy_timeout;
+static uint8_t s_rtc_ready;
+static uint32_t s_rtc_prescaler;
 
-void SysTick0_Handler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-void SysTick0_Handler(void)
+/* RTC 时基。LSI 在 Stop 下保持运行，RTC 因此可以作为睡眠期间的时间源。 */
+static void epd_rtc_ensure(void)
 {
-    if ((SysTick0->ISR & 1u) != 0u) {
-        SysTick0->ISR &= ~1u;
-    }
-}
+    EXTI_InitTypeDef exti = {0};
+    uint32_t guard = 0;
 
-/* HCLK 计数换算成 SysTick 计数 */
-static uint32_t epd_us_to_ticks(uint32_t us)
-{
-    uint64_t ticks = (uint64_t)us * HCLKClock / 1000000u;
-
-    if (ticks == 0u) {
-        ticks = 1u;
-    }
-    return (uint32_t)ticks;
-}
-
-static void epd_timer_ensure(void)
-{
-    static uint8_t ready;
-
-    if (ready != 0u) {
+    if (s_rtc_ready != 0u) {
         return;
     }
-    ready = 1;
+    s_rtc_ready = 1;
 
-    SysTick0->CTLR |= (1u << 2) | (1u << 0);   /* HCLK 源 + 使能 */
-    SysTick0->ISR &= ~1u;
-    NVIC_ClearPendingIRQ(SysTick0_IRQn);
-    NVIC_SetPriority(SysTick0_IRQn, 1);
-    NVIC_EnableIRQ(SysTick0_IRQn);
-}
+    RCC_HB1PeriphClockCmd(RCC_HB1Periph_PWR | RCC_HB1Periph_BKP, ENABLE);
+    PWR_BackupAccessCmd(ENABLE);
 
-/* WFI 到 ticks 个 HCLK 之后，或者被任意中断提前叫醒。
- * 提前醒没关系，调用方会重新判断条件、按剩余时间重装。 */
-static void epd_sleep_ticks(uint32_t ticks)
-{
-    if (ticks == 0u) {
-        ticks = 1u;
+    /* 固定使用 LSI：板载 LSE 起振不可靠，一旦停振 RTC 就失去时钟，
+     * RTC_WaitForLastTask() 会死等 RTOFF 把整机挂死。LSI 精度差一些但不会停。 */
+    RCC_RTCCLKCmd(DISABLE);
+
+    /* RTCSEL 一旦选定就被锁定，只有备份域复位才能重新选择。
+     * 不先复位的话，之前锁在 LSE 的板子切不过去，RTC 会完全没有时钟。 */
+    RCC_BackupResetCmd(ENABLE);
+    RCC_BackupResetCmd(DISABLE);
+    PWR_BackupAccessCmd(ENABLE);
+
+    RCC_LSICmd(ENABLE);
+    for (guard = 0; RCC_GetFlagStatus(RCC_FLAG_LSIRDY) != SET; ++guard) {
+        if (guard >= EPD_LSI_WAIT_LOOPS) {
+            break;
+        }
     }
 
-    epd_timer_ensure();
+    s_rtc_prescaler = EPD_RTC_PRESCALER_LSI;
+    RCC_RTCCLKConfig(RCC_RTCCLKSource_LSI);
+    __asm__ volatile ("fence");
+    RCC_RTCCLKCmd(ENABLE);
 
-    SysTick0->ISR &= ~1u;
-    NVIC_ClearPendingIRQ(SysTick0_IRQn);
-    SysTick0->CMP = SysTick0->CNT + ticks;
-    SysTick0->CTLR |= (1u << 1);               /* 打开比较中断 */
-    __WFI();
-    SysTick0->CTLR &= ~(1u << 1);
-    SysTick0->ISR &= ~1u;
+    RTC_WaitForLastTask();
+    RTC_WaitForSynchro();
+
+    RTC_ITConfig(RTC_IT_ALR, DISABLE);
+    RTC_ClearITPendingBit(RTC_IT_ALR);
+    RTC_WaitForLastTask();
+
+    RTC_EnterConfigMode();
+    RTC_SetPrescaler(s_rtc_prescaler);
+    RTC_WaitForLastTask();
+    RTC_SetCounter(0);
+    RTC_WaitForLastTask();
+    RTC_ExitConfigMode();
+    RTC_WaitForLastTask();
+
+    /* RTC 闹钟走 EXTI17，既是 Stop 的定时唤醒源，也是 BUSY 超时的兜底 */
+    exti.EXTI_Line = EXTI_Line17;
+    exti.EXTI_Mode = EXTI_Mode_Interrupt;
+    exti.EXTI_Trigger = EXTI_Trigger_Rising;
+    exti.EXTI_LineCmd = ENABLE;
+    EXTI_Init(&exti);
+
+    NVIC_SetPriority(RTCAlarm_IRQn, 1);
+    NVIC_EnableIRQ(RTCAlarm_IRQn);
 }
 
+/* RTC 计数器（1 ms 一格）。 */
+uint32_t EPD_TickMs(void)
+{
+    return RTC_GetCounter();
+}
+
+void RTCAlarm_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void RTCAlarm_IRQHandler(void)
+{
+    /* RTC 闹钟也是 Stop 的唤醒源之一，同样先恢复时钟再处理标志 */
+    epd_clock_restore();
+
+    if (RTC_GetFlagStatus(RTC_FLAG_ALR) != RESET) {
+        EXTI_ClearITPendingBit(EXTI_Line17);
+        RTC_ClearITPendingBit(RTC_IT_ALR);
+        RTC_WaitForLastTask();
+    }
+}
+
+static void epd_rtc_alarm_off(void)
+{
+    RTC_ITConfig(RTC_IT_ALR, DISABLE);
+    EXTI_ClearITPendingBit(EXTI_Line17);
+    RTC_ClearITPendingBit(RTC_IT_ALR);
+    RTC_WaitForLastTask();
+}
+
+static void epd_rtc_alarm(uint32_t ms)
+{
+    if (ms == 0u) {
+        ms = 1u;
+    }
+
+    epd_rtc_alarm_off();
+    RTC_SetAlarm(RTC_GetCounter() + ms);
+    RTC_WaitForLastTask();
+    RTC_ITConfig(RTC_IT_ALR, ENABLE);
+    RTC_WaitForLastTask();
+}
+
+vu32 tmp = 0,cfg = 0;
+
+
+void PWR_STOPMode_LP_Cmd(FunctionalState NewState)
+{
+    uint32_t id = 0;
+    id = (((*(uint32_t *)0x1FFFF704) & (0x000000F0)) >> 4);
+    if(NewState != DISABLE)
+    {
+        switch(id)
+        {
+            case 0:
+            {
+                cfg &= ~((0x7 << 17));
+                cfg |= ((0x1 << 17));
+                break;
+            }
+            case 1:
+            {
+                cfg &= ~((0x7 << 17) | (0x7 << 4));
+                cfg |= ((0x1 << 4));
+                break;
+            }
+            case 2:
+            {
+                cfg &= ~((0x7 << 17) | (0x7 << 4));
+                break;
+            }
+            default:
+            {
+                break;
+            }
+        }
+        *(vu32*)SYS_CFGR0_BASE = cfg;
+    }
+    else
+    {
+        *(vu32*)SYS_CFGR0_BASE = tmp;
+        Delay_Us(200);
+    }
+}
+
+/* Stop 唤醒后系统时钟会切回 HSI，必须恢复 PLL，否则 SPI 分频后的实际速率会变。
+ * 只有真的进了 Stop 才恢复：V5F 还在跑时系统没停时钟，SWS 仍然是 PLL。 */
+static void epd_clock_restore(void)
+{
+
+#if 0
+      PWR_STOPMode_LP_Cmd(DISABLE);
+      SystemInit(); 
+#else
+    uint32_t guard;
+    uint32_t tmp;
+
+    if ((RCC->CFGR0 & RCC_SWS) != RCC_SWS_HSI) {
+        return;   /* 没真进 Stop，时钟仍是 PLL */
+    }
+
+    g_epd_phase = 4u;
+
+    /* PWR_EnterSTOPMode() 只置 LPDS、退出时不清，先把内部调压器切回正常档，
+     * 再留 ~200 us 稳定时间（官方 PWR_STOPMode_LP_Cmd(DISABLE) 里同样是 Delay_Us(200)），
+     * 最后才恢复时钟。 */
+    PWR->CTLR &= ~(uint32_t)0x00000001u;
+    for (guard = 0; guard < 400u; ++guard) {
+        __asm__ volatile ("nop");
+    }
+
+    /* 与 SystemInit() 一致的寄存器前置准备：PLL 参考源 / SYSPLL 选择 / 中断标志都在这里，
+     * 少这些位即使 PLLMUL/PLLSRC 写对了 PLL 也锁不住（实测表现为 PLLRDY 一直不来）。 */
+    RCC->CTLR |= (uint32_t)0x00000001u;
+    RCC->CFGR0 &= (uint32_t)0x305C0000u;
+    guard = 0;
+    while ((RCC->CFGR0 & RCC_SWS) != RCC_SWS_HSI) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_CLK_SW);
+            g_epd_phase = 1u;
+            return;
+        }
+    }
+    RCC->CFGR0 &= (uint32_t)0xFFBFFFFFu;
+    RCC->PLLCFGR &= (uint32_t)0x7FFFFFFFu;
+    RCC->CTLR &= (uint32_t)0x6AA6FFFFu;
+    RCC->CTLR &= (uint32_t)0xFFFBFFFFu;
+    RCC->PLLCFGR &= (uint32_t)0x0FFFC000u;
+    RCC->PLLCFGR |= (uint32_t)0x00000004u;
+    RCC->INTR = 0x00FF0000u;
+    RCC->CFGR2 &= 0x0C600000u;
+    RCC->PLLCFGR2 &= 0xFFF0E080u;
+    RCC->PLLCFGR2 |= 0x00080020u;
+
+    /* PLL 时钟源 = HSI（25 MHz × 16 = 400 MHz）。
+     * 用内部 HSI 后唤醒不需要等外部晶振起振，恢复时间从 ~1.5 ms 降到几十 us。 */
+    RCC->PLLCFGR &= ~RCC_PLLMUL;
+    RCC->PLLCFGR |= RCC_PLLMUL16;
+    RCC->PLLCFGR &= ~RCC_PLL_SRC_DIV;
+    RCC->PLLCFGR |= RCC_PLL_SRC_DIV1;
+    RCC->PLLCFGR &= ~RCC_PLLSRC;
+    RCC->PLLCFGR |= RCC_PLLSRC_HSI;
+    guard = 0;
+    while ((RCC->PLLCFGR & RCC_PLLSRC) != RCC_PLLSRC_HSI) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_CLK_PLL);
+            g_epd_phase = 1u;
+            return;
+        }
+    }
+
+    RCC->CTLR |= RCC_PLLON;
+    guard = 0;
+    while ((RCC->CTLR & RCC_PLLRDY) == 0u) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_CLK_PLL);
+            g_epd_phase = 1u;
+            return;
+        }
+    }
+
+    /* 打开 PLL 输出门，并把 SYSPLL 源选回 PLL_CLK */
+    RCC->PLLCFGR &= ~RCC_SYSPLL_GATE;
+    RCC->PLLCFGR &= ~RCC_SYSPLL_SEL;
+    guard = 0;
+    while ((RCC->PLLCFGR & RCC_SYSPLL_SEL) != 0u) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_CLK_PLL);
+            g_epd_phase = 1u;
+            return;
+        }
+    }
+
+    /* 恢复分频与 FLASH 等待周期，最后再切 SYSCLK */
+    RCC->CFGR0 &= ~RCC_HPRE;
+    RCC->CFGR0 |= RCC_HPRE_DIV1;
+    RCC->CFGR0 &= ~RCC_FPRE;
+    RCC->CFGR0 |= RCC_FPRE_DIV4;
+    tmp = FLASH->ACTLR;
+    tmp &= ~(uint32_t)0x3u;
+    tmp |= FLASH_ACTLR_LATENCY_HCLK_DIV2;
+    FLASH->ACTLR = tmp;
+
+    RCC->PLLCFGR |= RCC_SYSPLL_GATE;
+    RCC->CFGR0 &= ~RCC_SW;
+    RCC->CFGR0 |= RCC_SW_PLL;
+    guard = 0;
+    while ((RCC->CFGR0 & RCC_SWS) != RCC_SWS_PLL) {
+        if (++guard >= EPD_WAIT_GUARD) {
+            EPD_SetFault(EPD_FAULT_CLK_SW);
+            g_epd_phase = 1u;
+            return;
+        }
+    }
+
+    SystemAndCoreClockUpdate();
+    /* 不再调用 epd_hw_init()：Stop 只是停时钟，SPI/GPIO/DMA 寄存器内容都还在，
+     * 唤醒后分频一样；而它会在面板刷新途中重配 SPI/DMA 并拨动 RST，破坏画面。 */
+    g_epd_phase = 1u;
+#endif
+}
+
+/* 睡 ms 毫秒，Stop 模式（两核都进才真正停机，省电就靠这个）。
+ * 唤醒后系统时钟会回到 HSI，必须由 epd_clock_restore() 先把调压器/VDDK 恢复再拉回 PLL。 */
+static void epd_stop_ms(uint32_t ms)
+{
+    g_epd_phase = 6u;
+    epd_rtc_alarm(ms);
+    g_epd_phase = 5u;
+    GPIO_ResetBits(GPIOB, GPIO_Pin_1);
+    PWR_EnterSTOPMode(PWR_Regulator_LowPower, PWR_STOPEntry_WFI);
+    epd_clock_restore();
+    epd_rtc_alarm_off();
+    GPIO_SetBits(GPIOB, GPIO_Pin_1);
+}
 /* 低功耗等待：任意中断都会把 CPU 叫醒，适合主循环的空闲等待。 */
 void EPD_SleepUs(uint32_t us)
 {
-    epd_sleep_ticks(epd_us_to_ticks(us));
+    epd_stop_ms((us + 999u) / 1000u);
 }
 
 static void epd_wait(uint32_t timeout_us)
 {
     uint32_t deadline;
 
-    epd_timer_ensure();
-    deadline = SysTick0->CNT + epd_us_to_ticks(timeout_us);
+    epd_rtc_ensure();
+    deadline = EPD_TickMs() + ((timeout_us + 999u) / 1000u);
+    NVIC_DisableIRQ(IPC_CH2_IRQn);
 
     while (BUSY()) {
-        const int32_t remain = (int32_t)(deadline - SysTick0->CNT);
+        const int32_t remain = (int32_t)(deadline - EPD_TickMs());
 
         if (remain <= 0) {
             s_busy_timeout = 1;
+            NVIC_EnableIRQ(IPC_CH2_IRQn);
+            g_epd_phase = 7u;
+            EPD_SetFault(EPD_FAULT_BUSY);
             PRINT("[EPD] busy timeout\r\n");
             return;
         }
-        epd_sleep_ticks((uint32_t)remain);
+        epd_stop_ms((uint32_t)remain);
     }
+    NVIC_EnableIRQ(IPC_CH2_IRQn);
 }
 
 /* -------------------------------------------------------------- helpers */
@@ -691,9 +1048,10 @@ void EPD_SendDisplay(const uint8_t *image)
     epd_wait(EPD_BUSY_POLLS_LONG);      /* 全刷一次约 1.3 秒 */
     if (!BUSY()) {
         analog_on = 0;      /* the full sequence powers down by itself */
-        for (uint32_t i = 0; i < EPD_PIXELS; ++i) {
-            s_net[i] = 0;
-        }
+        memset(s_net, 0, EPD_PIXELS);
+        memset(s_net_next, 0, EPD_PIXELS);
+        memset(s_active, 0x01, EPD_FRAME_BYTES);
+        s_planned_count = 0;
     }
 }
 
@@ -702,6 +1060,7 @@ void EPD_FastPrepareFrames(uint8_t frames)
     static uint8_t scratch[159];
 
     s_fast_frames = (frames != 0u) ? frames : 1u;
+    memset(s_active, 0x01, EPD_FRAME_BYTES);
     for (uint16_t i = 0; i < 159u; ++i) {
         scratch[i] = lut_fast_base[i];
     }
@@ -766,6 +1125,7 @@ void EPD_SetPulseBudget(uint8_t black, uint8_t white)
     }
     s_dc_black = black;
     s_dc_white = white;
+    memset(s_active, 0x01, EPD_FRAME_BYTES);
 }
 
 /* 帧率限制：BUSY 落下后额外等待的微秒数。0 = 不限速。 */
@@ -815,6 +1175,7 @@ static int epd_plan_frame(const uint8_t *next, uint8_t *r0, uint8_t *r1)
     const int lo = -(int)s_dc_white;
     uint8_t first = EPD_H;
     uint8_t last = 0;
+    uint16_t planned = 0;
     int driven = 0;
 
     for (uint32_t row = 0; row < EPD_H; ++row) {
@@ -823,28 +1184,42 @@ static int epd_plan_frame(const uint8_t *next, uint8_t *r0, uint8_t *r1)
         int any = 0;
 
         for (uint32_t k = 0; k < EPD_STRIDE; ++k) {
-            const uint8_t px = next[base + k];
+            const uint32_t index = base + k;
+            const uint32_t pixel = pbase + k * 8u;
+            const uint8_t px = next[index];
             uint8_t mb = 0;
             uint8_t mw = 0;
+            uint8_t next_active = 0;
 
-            for (uint8_t b = 0; b < 8u; ++b) {
-                const uint8_t m = (uint8_t)(0x80u >> b);
-                const uint32_t p = pbase + k * 8u + b;
-                const int d = ((px & m) != 0u) ? -(int)s_fast_frames : (int)s_fast_frames;
-                const int v = (int)s_net[p] + d;
+            if ((s_active[index] != 0u) || (px != s_target[index])) {
+                s_planned_pixels[planned++] = (uint16_t)pixel;
+                for (uint8_t b = 0; b < 8u; ++b) {
+                    const uint8_t m = (uint8_t)(0x80u >> b);
+                    const uint32_t p = pixel + b;
+                    const int d = ((px & m) != 0u) ? -(int)s_fast_frames : (int)s_fast_frames;
+                    const int old = (int)s_net[p];
+                    const int v = old + d;
+                    int committed = old;
 
-                if ((v >= lo) && (v <= hi)) {
-                    if (d > 0) {
-                        mb = (uint8_t)(mb | m);
-                    } else {
-                        mw = (uint8_t)(mw | m);
+                    if ((v >= lo) && (v <= hi)) {
+                        if (d > 0) {
+                            mb = (uint8_t)(mb | m);
+                        } else {
+                            mw = (uint8_t)(mw | m);
+                        }
+                        any = 1;
+                        committed = v;
                     }
-                    any = 1;
+                    s_net_next[p] = (int8_t)committed;
+                    if ((committed + d >= lo) && (committed + d <= hi)) {
+                        next_active = 1;
+                    }
                 }
             }
 
-            s_mask_black[base + k] = mb;
-            s_mask_white[base + k] = mw;
+            s_active_next[index] = next_active;
+            s_mask_black[index] = mb;
+            s_mask_white[index] = mw;
         }
 
         if (any != 0) {
@@ -856,37 +1231,28 @@ static int epd_plan_frame(const uint8_t *next, uint8_t *r0, uint8_t *r1)
         }
     }
 
+    s_planned_count = planned;
     *r0 = first;
     *r1 = last;
 
     return driven;
 }
 
-/* 扫描已经交给面板后，按实际掩码更新净驱动帧数。 */
-static void epd_apply_charge(void)
+static void epd_commit_plan(const uint8_t *target)
 {
-    for (uint32_t row = 0; row < EPD_H; ++row) {
-        const uint32_t base = row * EPD_STRIDE;
-        const uint32_t pbase = row * EPD_W;
+    for (uint16_t i = 0; i < s_planned_count; ++i) {
+        const uint32_t p = s_planned_pixels[i];
+        memcpy(&s_net[p], &s_net_next[p], 8u);
+    }
+    memcpy(s_active, s_active_next, EPD_FRAME_BYTES);
+    memcpy(s_target, target, EPD_FRAME_BYTES);
+}
 
-        for (uint32_t k = 0; k < EPD_STRIDE; ++k) {
-            const uint8_t mb = s_mask_black[base + k];
-            const uint8_t mw = s_mask_white[base + k];
-
-            if ((uint8_t)(mb | mw) == 0u) {
-                continue;
-            }
-            for (uint8_t b = 0; b < 8u; ++b) {
-                const uint8_t m = (uint8_t)(0x80u >> b);
-                const uint32_t p = pbase + k * 8u + b;
-
-                if ((mb & m) != 0u) {
-                    s_net[p] = (int8_t)(s_net[p] + (int)s_fast_frames);
-                } else if ((mw & m) != 0u) {
-                    s_net[p] = (int8_t)(s_net[p] - (int)s_fast_frames);
-                }
-            }
-        }
+static void epd_discard_plan(void)
+{
+    for (uint16_t i = 0; i < s_planned_count; ++i) {
+        const uint32_t p = s_planned_pixels[i];
+        memcpy(&s_net_next[p], &s_net[p], 8u);
     }
 }
 
@@ -938,9 +1304,11 @@ static void epd_activate(void)
 void EPD_FastBegin(const uint8_t *shown)
 {
     (void)shown;
-    for (uint32_t i = 0; i < EPD_PIXELS; ++i) {
-        s_net[i] = 0;
-    }
+    memset(s_net, 0, EPD_PIXELS);
+    memset(s_net_next, 0, EPD_PIXELS);
+    memset(s_target, 0, EPD_FRAME_BYTES);
+    memset(s_active, 0x01, EPD_FRAME_BYTES);
+    s_planned_count = 0;
     s_scan_count = 0;
     s_hold_pending = 0;
     s_pending = 0;
@@ -992,8 +1360,9 @@ int EPD_FastFrame(const uint8_t *next)
 
     if (driven) {
         /* busy高的时候不能写RAM，所以还是得等刷完了再写进去 */
-        EPD_FastSync();      // 等上一帧刷完                                    
+        EPD_FastSync();      // 等上一帧刷完
         if (s_pending) {
+            epd_discard_plan();
             return -1;
         }
         s_row0 = row0;
@@ -1016,22 +1385,14 @@ int EPD_FastFrame(const uint8_t *next)
 
         ++s_scan_count;
         s_hold_pending = 1;
-
-        /* 这一帧已经交给面板了，更新每像素净驱动帧数。 */
-        epd_apply_charge();
+        epd_commit_plan(next);
     } else if (EPD_HOLD_ENDING && s_hold_pending) {
         /* HOLD 收尾：沿用上一次真正发过的行范围，两块全 0 掩码，所有像素都不驱动，
          * 让上一次的驱动把波形走完而不是停在半途。 */
         if (s_row1 >= s_row0) {
-            const uint32_t first = (uint32_t)s_row0 * EPD_STRIDE;
-            const uint32_t bytes = (uint32_t)(s_row1 - s_row0 + 1u) * EPD_STRIDE;
-
-            for (uint32_t i = 0; i < bytes; ++i) {
-                s_mask_black[first + i] = 0x00;
-            }
-
             EPD_FastSync();          /* 等上一帧刷完 */
             if (s_pending) {
+                epd_discard_plan();
                 return -1;
             }
             epd_send_one_plane(0x26, s_mask_black, s_row0, s_row1, s_col0, s_col1);
@@ -1043,6 +1404,9 @@ int EPD_FastFrame(const uint8_t *next)
         s_hold_pending = 0;
     }
 
+    if (!driven) {
+        epd_commit_plan(next);
+    }
     return driven;
 }
 

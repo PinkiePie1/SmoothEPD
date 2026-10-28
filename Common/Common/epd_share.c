@@ -108,6 +108,32 @@ void IPC_CH2_Handler(void)
 
 #if defined(Core_V5F)
 
+/* V5F 的空闲睡眠：必须和 V3F 一起请求 Stop，芯片才会真正进低功耗。
+ * 唤醒后系统时钟会回到 HSI，PLL 由 V3F 恢复，这里不动 RCC。 */
+void epd_share_sleep(void)
+{
+    static uint8_t ready;
+
+    if (ready == 0u) {
+        GPIO_InitTypeDef gpio = {0};
+
+        ready = 1;
+        RCC_HB1PeriphClockCmd(RCC_HB1Periph_PWR, ENABLE);
+        RCC_HB2PeriphClockCmd(RCC_HB2Periph_GPIOB, ENABLE);
+
+        /* 示波器观察用：醒来高、Stop 低（PB0） */
+        gpio.GPIO_Pin = GPIO_Pin_0;
+        gpio.GPIO_Speed = GPIO_Speed_Very_High;
+        gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+        GPIO_Init(GPIOB, &gpio);
+        GPIO_SetBits(GPIOB, GPIO_Pin_0);
+    }
+
+    GPIO_ResetBits(GPIOB, GPIO_Pin_0);
+    PWR_EnterSTOPMode(PWR_Regulator_LowPower, PWR_STOPEntry_WFI);
+    GPIO_SetBits(GPIOB, GPIO_Pin_0);
+}
+
 uint8_t *epd_share_begin(void)
 {
     /* 正常情况下每帧都先等 V3F 取走，待消费帧数最多 1，这里不会失败。
@@ -135,9 +161,9 @@ void epd_share_wait_consumed(void)
     const uint32_t produced = EPD_SHARE->write_seq;
 
     /* 等到 V3F 把已经提交的帧全部取走。IPC_CH1 中断只负责把 WFI 叫醒，
-     * 真正的条件用共享内存的序号判断，避免丢唤醒。 */
+     * 真正的条件用共享内存的序号判断；V3F 的空闲心跳用于兜底丢失的唤醒。 */
     while (EPD_SHARE->read_seq != produced) {
-        __WFI();
+        epd_share_sleep();
     }
     epd_share_fence();
 }
@@ -192,6 +218,12 @@ void epd_share_release(void)
     EPD_SHARE->read_seq = EPD_SHARE->read_seq + 1u;
 
     /* 取走一帧后立刻允许 V5F 生产下一帧 */
+    IPC_SetFlagStatus(SHARE_CMD_CH, SHARE_CMD_BIT);
+}
+
+void epd_share_kick_producer(void)
+{
+    IPC_ITConfig(SHARE_CMD_CH, SHARE_CMD_BIT, ENABLE);
     IPC_SetFlagStatus(SHARE_CMD_CH, SHARE_CMD_BIT);
 }
 

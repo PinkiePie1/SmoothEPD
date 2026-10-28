@@ -203,8 +203,17 @@ __attribute__((used)) int _write(int fd, char *buf, int size)
 #if(DEBUG == DEBUG_IPC)
         v5con_putc(*buf++);                 /* V5F：交给 V3F 转发 */
 #elif(DEBUG == DEBUG_UART1)
-        while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
-        USART_SendData(USART1, *buf++);
+        {
+            uint32_t guard = 0;
+            while(USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET)
+            {
+                if(++guard >= 2000000u)
+                {
+                    break;
+                }
+            }
+            USART_SendData(USART1, *buf++);
+        }
 #elif(DEBUG == DEBUG_UART8)
         while(USART_GetFlagStatus(USART8, USART_FLAG_TC) == RESET);
         USART_SendData(USART8, *buf++);
