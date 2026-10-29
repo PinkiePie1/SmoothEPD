@@ -169,6 +169,20 @@ static void epd_rtc_wait_ready(void)
 
 /* Stop 唤醒后的时钟恢复：必须在唤醒中断里立刻做（官方 Stop_Mode 例程即如此），
  * 否则会有一段代码跑在 HSI 上，而且恢复时机也不可控。 */
+/* 官方 PWR_STOPMode_LP_Cmd(DISABLE) 的等价实现：把 SYS_CFGR0 写回进入 Stop 前的原值。
+ * 原值在第一次调用时保存，之后每次唤醒都写回，避免 VDDK 档位被残留改变。 */
+static uint32_t s_vddk_orig;
+static uint8_t  s_vddk_ready;
+
+static void epd_vddk_restore(void)
+{
+    if (s_vddk_ready == 0u) {
+        s_vddk_orig = *(volatile uint32_t *)SYS_CFGR0_BASE;
+        s_vddk_ready = 1u;
+    }
+    *(volatile uint32_t *)SYS_CFGR0_BASE = s_vddk_orig;
+}
+
 static void epd_clock_restore(void);
 
 
@@ -723,10 +737,10 @@ static void epd_clock_restore(void)
 
     g_epd_phase = 4u;
 
-    /* PWR_EnterSTOPMode() 只置 LPDS、退出时不清，先把内部调压器切回正常档，
-     * 再留 ~200 us 稳定时间（官方 PWR_STOPMode_LP_Cmd(DISABLE) 里同样是 Delay_Us(200)），
-     * 最后才恢复时钟。 */
+    /* 官方 Stop 唤醒顺序：先把 VDDK 电压恢复并稳定，再恢复时钟。
+     * PWR_EnterSTOPMode() 会置 LPDS 且退出时不自动清除，这里一并切回正常调压。 */
     PWR->CTLR &= ~(uint32_t)0x00000001u;
+    epd_vddk_restore();
     for (guard = 0; guard < 400u; ++guard) {
         __asm__ volatile ("nop");
     }
@@ -822,18 +836,29 @@ static void epd_clock_restore(void)
 #endif
 }
 
-/* 睡 ms 毫秒，Stop 模式（两核都进才真正停机，省电就靠这个）。
- * 唤醒后系统时钟会回到 HSI，必须由 epd_clock_restore() 先把调压器/VDDK 恢复再拉回 PLL。 */
-static void epd_stop_ms(uint32_t ms)
+/* 只做一次 Stop 睡眠，闹钟的装/卸由调用方负责。
+ * 关键：一次等待只装一次闹钟。若每次睡眠前都重装，可能出现"闹钟在进入 WFI 之前
+ * 就已经触发、被 ISR 清掉，随后又带着已消耗的闹钟进入 Stop"——那就再也醒不过来，
+ * 表现就是跑一段时间后整芯片停在 Stop、连 SWD 都不响应。 */
+static void epd_stop_once(void)
 {
-    g_epd_phase = 6u;
-    epd_rtc_alarm(ms);
     g_epd_phase = 5u;
     GPIO_ResetBits(GPIOB, GPIO_Pin_1);
     PWR_EnterSTOPMode(PWR_Regulator_LowPower, PWR_STOPEntry_WFI);
     epd_clock_restore();
-    epd_rtc_alarm_off();
     GPIO_SetBits(GPIOB, GPIO_Pin_1);
+}
+
+/* 睡 ms 毫秒：装一次闹钟 + 一次 Stop */
+static void epd_stop_ms(uint32_t ms)
+{
+    if (ms == 0u) {
+        ms = 1u;
+    }
+    g_epd_phase = 6u;
+    epd_rtc_alarm(ms);
+    epd_stop_once();
+    epd_rtc_alarm_off();
 }
 /* 低功耗等待：任意中断都会把 CPU 叫醒，适合主循环的空闲等待。 */
 void EPD_SleepUs(uint32_t us)
@@ -843,25 +868,46 @@ void EPD_SleepUs(uint32_t us)
 
 static void epd_wait(uint32_t timeout_us)
 {
+    const uint32_t timeout_ms = (timeout_us + 999u) / 1000u;
     uint32_t deadline;
+    uint32_t rounds = 0u;
 
     epd_rtc_ensure();
-    deadline = EPD_TickMs() + ((timeout_us + 999u) / 1000u);
     NVIC_DisableIRQ(IPC_CH2_IRQn);
+
+    if (BUSY() == 0) {
+        NVIC_EnableIRQ(IPC_CH2_IRQn);
+        return;
+    }
+
+    /* 整个等待只装一次闹钟：既当超时兜底，也避免每次睡眠重装闹钟的丢唤醒竞态。
+     * 正常唤醒靠 BUSY 的下降沿中断，闹钟只在面板卡住时兜底。 */
+    g_epd_phase = 6u;
+    epd_rtc_alarm(timeout_ms);
+    deadline = EPD_TickMs() + timeout_ms;
 
     while (BUSY()) {
         const int32_t remain = (int32_t)(deadline - EPD_TickMs());
 
         if (remain <= 0) {
-            s_busy_timeout = 1;
-            NVIC_EnableIRQ(IPC_CH2_IRQn);
+            s_busy_timeout = 1u;
             g_epd_phase = 7u;
             EPD_SetFault(EPD_FAULT_BUSY);
             PRINT("[EPD] busy timeout\r\n");
-            return;
+            break;
         }
-        epd_stop_ms((uint32_t)remain);
+
+        epd_stop_once();
+
+        /* 兜底：万一 BUSY 沿和闹钟都没能把我们叫醒并正常退出，也不要无限循环 */
+        if (++rounds > ((timeout_ms / 10u) + 20u)) {
+            s_busy_timeout = 1u;
+            EPD_SetFault(EPD_FAULT_BUSY);
+            break;
+        }
     }
+
+    epd_rtc_alarm_off();
     NVIC_EnableIRQ(IPC_CH2_IRQn);
 }
 
